@@ -475,6 +475,21 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
+def _row_slice_qlinear(lin, start, stop):
+    """An ``nn.QuantizedLinear`` over output rows [start, stop) of ``lin``
+    (same packed words, scales and biases, so each output is bit-identical)."""
+    q = nn.QuantizedLinear.__new__(type(lin))
+    nn.Module.__init__(q)
+    q.group_size, q.bits, q.mode = lin.group_size, lin.bits, getattr(lin, "mode", "affine")
+    q.weight = mx.contiguous(lin.weight[start:stop])
+    q.scales = mx.contiguous(lin.scales[start:stop])
+    biases = lin.get("biases")
+    q.biases = mx.contiguous(biases[start:stop]) if biases is not None else None
+    q.freeze()
+    mx.eval([a for a in (q.weight, q.scales, q.biases) if a is not None])
+    return q
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -547,6 +562,20 @@ class Inkling2Attention(nn.Module):
         )
         return tau.reshape(-1, length, 1, 1)
 
+    def prepare_kv_rows(self):
+        """Build (once, outside any compiled trace) quantized linears over the
+        k and v rows of a quantized ``in_proj``, for looped passes."""
+        if not self.sliding or "_kv_lin" in self.__dict__:
+            return
+        lin = self.in_proj
+        kv_lin = None
+        if isinstance(lin, nn.QuantizedLinear) and "bias" not in lin:
+            kv_lin = tuple(
+                _row_slice_qlinear(lin, a, b)
+                for a, b in ((self._cuts[0], self._cuts[1]), (self._cuts[1], self._cuts[2]))
+            )
+        object.__setattr__(self, "_kv_lin", kv_lin)
+
     def project(self, xq, xk, xv, ks, vs, tau):
         """Projections, short convs and clips. Returns head-major q/k/v, the
         relative bias [B, L, H, R], gate, sink and the next conv states."""
@@ -556,14 +585,22 @@ class Inkling2Attention(nn.Module):
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
             else:
-                # Looped passes give q, k and v their own inputs; one stacked
-                # projection serves all three.
-                pq, pk, pv = mx.split(
-                    self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
-                )
+                kv_lin = self.__dict__.get("_kv_lin")
+                if kv_lin is None or not 2 <= length <= 4:
+                    # (Stock qmm rounds an L-row call like the stacked 3L-row
+                    # one only for L in 2..4, so other lengths stay stacked.)
+                    # Looped passes give q, k and v their own inputs; one
+                    # stacked projection serves all three.
+                    pq, pk, pv = mx.split(
+                        self.in_proj(mx.concatenate([xq, xk, xv], axis=0)), 3, axis=0
+                    )
+                    k = pk[..., self._cuts[0] : self._cuts[1]]
+                    v = pv[..., self._cuts[1] : self._cuts[2]]
+                else:
+                    # k and v through only their own rows of in_proj.
+                    pq = self.in_proj(xq)
+                    k, v = kv_lin[0](xk), kv_lin[1](xv)
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
-                k = pk[..., self._cuts[0] : self._cuts[1]]
-                v = pv[..., self._cuts[1] : self._cuts[2]]
             k, ks = _static_conv(
                 k, self._k_taps, ks, self._sconv_scale, self.k_conv.dtype
             )
@@ -770,6 +807,8 @@ class Inkling2Layer(nn.Module):
         pre = self._pre_compiled if compiled else self._pre
         post = self._post_compiled if compiled else self._post
         messages = self.loop_message(*bank) if bank is not None else None
+        if messages is not None:
+            self.attn.prepare_kv_rows()
         q, k, v, rel, gate, sink, ks, vs, h_n = pre(
             h, blocks, states[0], states[1], tau, messages
         )
