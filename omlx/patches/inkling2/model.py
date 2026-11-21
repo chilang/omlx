@@ -159,6 +159,16 @@ def _softcapped_swiglu(gate: mx.array, up: mx.array, gcap: mx.array, ucap: mx.ar
     return out.astype(dtype)
 
 
+def _scaled_swiglu(y, s, gcap, ucap):
+    """``_softcapped_swiglu`` of ``y * s`` (interleaved gate/up columns).
+
+    The scale multiplies the gate and up slices separately: elementwise the
+    same BF16 products, but it fuses into the activation kernel instead of
+    running as its own pass over ``y``.
+    """
+    return _softcapped_swiglu(y[..., 0::2] * s, y[..., 1::2] * s, gcap, ucap)
+
+
 # Row batches up to this size (speculative verify) take the expert-grouped
 # NVFP4 kernel; its bit-exactness to gather_qmm is tested at 1..8 rows.
 _GROUPED_MAX_ROWS = 8
@@ -294,8 +304,8 @@ class Inkling2Experts(nn.Module):
         y = kernels.nvfp4_gather_rows(
             x, self.w13.weight, self.w13.scales, order, sorted_e, top, rows
         ).reshape(rows, top, 1, -1)
-        y = y * self.w13.post_scale(inds)[..., None, None].astype(y.dtype)
-        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+        s13 = self.w13.post_scale(inds)[..., None, None].astype(y.dtype)
+        act = _scaled_swiglu(y, s13, self._gcap, self._ucap)
         z = kernels.nvfp4_gather_rows(
             act.reshape(rows * top, -1),
             self.w2.weight,
@@ -325,8 +335,13 @@ class Inkling2Experts(nn.Module):
         y = self.w13(xe, idx, do_sort)
         s13 = self.w13.post_scale(idx)
         if s13 is not None:
-            y = y * s13[..., None, None].astype(y.dtype)
-        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+            act = _scaled_swiglu(
+                y, s13[..., None, None].astype(y.dtype), self._gcap, self._ucap
+            )
+        else:
+            act = _softcapped_swiglu(
+                y[..., 0::2], y[..., 1::2], self._gcap, self._ucap
+            )
         z = self.w2(act, idx, do_sort)
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
