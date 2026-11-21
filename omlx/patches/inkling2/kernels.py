@@ -674,6 +674,73 @@ inline float fp4v(ushort b) {
 _nvfp4_rows_kernel = None
 
 
+# Loop-controller projections for decode/verify-sized rows: FP32 inputs times
+# BF16 weights (the controllers' FP32 copies hold BF16 values), FP32 out.
+# Per output column the arithmetic is MLX's FP32 ``gemv_t`` with SM = 8,
+# TM = 4: eight partial sums, partial j over input rows i * 32 + j * 4 + tm in
+# order, combined by the simd_shuffle_down tree ((p0+p4)+(p2+p6)) +
+# ((p1+p5)+(p3+p7)). Here partial j is simdgroup j and the lanes are 32
+# consecutive output columns, so each weight row is read once (half the bytes
+# of the FP32 copy) for every row of the batch.
+_LOOP_GEMV_SOURCE = """
+    uint col = threadgroup_position_in_grid.x * 32 + thread_index_in_simdgroup;
+    uint bi = threadgroup_position_in_grid.y;
+    uint j = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    const device bfloat16_t* wp = w + (size_t)bi * K * N + col;
+    const device float* zp = z + (size_t)bi * ROWS * K;
+    float acc[ROWS];
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+    for (int i = 0; i < K / 32; ++i) {
+        for (int tm = 0; tm < 4; ++tm) {
+            int k = i * 32 + j * 4 + tm;
+            float wv = static_cast<float>(wp[(size_t)k * N]);
+            for (int r = 0; r < ROWS; ++r) {
+                float vc = zp[r * K + k];
+                acc[r] += vc * wv;
+            }
+        }
+    }
+    threadgroup float red[8][ROWS][32];
+    for (int r = 0; r < ROWS; ++r) red[j][r][lane] = acc[r];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (j == 0) {
+        for (int r = 0; r < ROWS; ++r) {
+            float p0 = red[0][r][lane], p1 = red[1][r][lane], p2 = red[2][r][lane], p3 = red[3][r][lane];
+            float p4 = red[4][r][lane], p5 = red[5][r][lane], p6 = red[6][r][lane], p7 = red[7][r][lane];
+            float a0 = p0 + p4, a1 = p1 + p5, a2 = p2 + p6, a3 = p3 + p7;
+            float b0 = a0 + a2, b1 = a1 + a3;
+            out[((size_t)bi * ROWS + r) * N + col] = b0 + b1;
+        }
+    }
+"""
+_loop_gemv_kernel = None
+
+
+def loop_gemv(z, w):
+    """``z @ w.astype(float32)`` for ``z`` [B, rows, K] FP32 and ``w`` [B, K, N]
+    BF16, bit-equal to MLX's FP32 matrix-vector product per row."""
+    global _loop_gemv_kernel
+    if _loop_gemv_kernel is None:
+        _loop_gemv_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_loop_gemv",
+            input_names=["z", "w"],
+            output_names=["out"],
+            source=_LOOP_GEMV_SOURCE,
+        )
+    b, rows, k = z.shape
+    n = w.shape[-1]
+    (out,) = _loop_gemv_kernel(
+        inputs=[z, w],
+        template=[("K", k), ("N", n), ("ROWS", rows)],
+        grid=((n // 32) * 256, b, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(b, rows, n)],
+        output_dtypes=[mx.float32],
+    )
+    return out
+
+
 def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int):
     """``y[pair] = x[pair // src_div] @ W[expert(pair)]^T`` for NVFP4 experts.
 
