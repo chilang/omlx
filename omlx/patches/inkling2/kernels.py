@@ -318,6 +318,8 @@ _FLASH_SOURCE = """
 _flash_kernel = None
 # Query blocks shorter than this keep the SDPA path (decode and verify).
 _FLASH_MIN_QUERIES = 32
+# Query blocks up to this length (decode and speculative verify) attend row by row.
+_ROWWISE_MAX_QUERIES = 16
 
 
 def _use_flash(length: int, window: int) -> bool:
@@ -398,6 +400,27 @@ def banded_sink_attention(
     b, length = q.shape[0], q.shape[2]
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
+    if b == 1 and length <= _ROWWISE_MAX_QUERIES and left_padding is None:
+        # Speculative verify: each query row attends like the decode step at
+        # its position (keys up to and including itself), so verify rows match
+        # decode rows bit for bit and the K/V cache is not copied for a sink
+        # row as the masked path does.
+        s = k.shape[2]
+        rows = []
+        for i in range(length):
+            end = s - length + i + 1
+            rows.append(
+                _decode_attention(
+                    q[:, :, i : i + 1],
+                    k[:, :, :end],
+                    v[:, :, :end],
+                    rel[:, i : i + 1],
+                    sink[:, i : i + 1],
+                    scale,
+                    window,
+                )
+            )
+        return mx.concatenate(rows, axis=2)
     if q.dtype == mx.bfloat16 and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
