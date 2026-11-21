@@ -429,15 +429,22 @@ def _static_conv(x, taps, state, scale, wdtype):
     """Depthwise causal conv (``taps[K-1]`` is the current token).
 
     Returns the output and the padded input window ``[state, x]``; its last
-    ``K - 1`` rows are the next state.
+    ``K - 1`` rows are the next state. A single-token step returns just the
+    next state and reads the window rows from ``state`` and ``x`` directly,
+    so no concatenation sits in front of the conv.
     """
     xf = x.astype(mx.float32)
     k = len(taps)
-    xp = mx.concatenate([state, xf], axis=1)
     length = xf.shape[1]
-    out = taps[0] * xp[:, 0:length]
+    if length == 1:
+        rows = [state[:, j : j + 1] for j in range(k - 1)] + [xf]
+        xp = mx.concatenate([state[:, 1:], xf], axis=1)
+    else:
+        xp = mx.concatenate([state, xf], axis=1)
+        rows = [xp[:, j : j + length] for j in range(k)]
+    out = taps[0] * rows[0]
     for j in range(1, k):
-        out = out + taps[j] * xp[:, j : j + length]
+        out = out + taps[j] * rows[j]
     # The reference rounds the depthwise conv to the weight dtype before the
     # residual add.
     out = (out.astype(wdtype).astype(mx.float32) + xf) * scale
@@ -450,12 +457,17 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     xf = x.astype(mx.float32)
     b, length, c = xf.shape
     k = len(static_w)
-    xp = mx.concatenate([state, xf], axis=1)
+    if length == 1:
+        # As in _static_conv: window rows straight from state and x.
+        rows = [state[:, j : j + 1] for j in range(k - 1)] + [xf]
+        xp = mx.concatenate([state[:, 1:], xf], axis=1)
+    else:
+        xp = mx.concatenate([state, xf], axis=1)
+        rows = [xp[:, j : j + length] for j in range(k)]
     dyn = dyn.astype(mx.float32).reshape(b, length, heads, 1, k)
     out = None
     for lag in range(k):
-        start = k - 1 - lag
-        window = xp[:, start : start + length].reshape(b, length, heads, c // heads)
+        window = rows[k - 1 - lag].reshape(b, length, heads, c // heads)
         tap = static_w[lag].reshape(heads, c // heads) + dyn[..., lag]
         term = window * tap
         out = term if out is None else out + term
@@ -773,7 +785,8 @@ class Inkling2Layer(nn.Module):
             keep = self._conv_k - 1
             for slot, window in enumerate(windows):
                 # A small copy, so the state does not pin the chunk's window.
-                conv[slot] = window[:, -keep:] * 1.0
+                # A single-token step already returns a fresh next state.
+                conv[slot] = window if length == 1 else window[:, -keep:] * 1.0
         return h
 
 
