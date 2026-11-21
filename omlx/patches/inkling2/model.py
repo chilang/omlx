@@ -554,8 +554,21 @@ class Inkling2Attention(nn.Module):
         if self.log_floor is None:
             return None
         offset = kv.offset if kv is not None else 0
+        key = None
         if isinstance(offset, mx.array):
             offset = offset.reshape(-1, 1)
+        else:
+            # Every full layer visit of one forward sees the same positions.
+            key = (offset, length, self.log_floor, self.log_alpha)
+            tau = _tau_memo.get(key)
+            if tau is not None:
+                return tau
+        tau = self._log_tau(offset, length)
+        if key is not None:
+            _tau_memo[key] = tau
+        return tau
+
+    def _log_tau(self, offset, length):
         pos = mx.arange(length) + offset
         tau = 1.0 + self.log_alpha * mx.log(
             mx.maximum((pos + 1).astype(mx.float32) / self.log_floor, 1.0)
@@ -677,6 +690,11 @@ class Inkling2Attention(nn.Module):
             gate.dtype
         )
         return self.o_proj(out)
+
+
+# log_tau per (offset, length): shared by the full layers' visits of one
+# forward and reset at the start of each text forward.
+_tau_memo: dict = {}
 
 
 def _cumsum(xs):
@@ -868,6 +886,7 @@ class Inkling2TextModel(nn.Module):
                 f"({self.num_visits}), got {len(cache)}"
             )
         kernels.reset_band_memo()
+        _tau_memo.clear()
         blocks: list = []
         prelude = bank = None
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
