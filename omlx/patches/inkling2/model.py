@@ -867,6 +867,7 @@ class Inkling2TextModel(nn.Module):
                 f"Inkling 2 needs one cache entry per layer visit "
                 f"({self.num_visits}), got {len(cache)}"
             )
+        kernels.reset_band_memo()
         blocks: list = []
         prelude = bank = None
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):

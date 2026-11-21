@@ -405,6 +405,31 @@ def banded_sink_attention(
     return _masked_attention(q, k, v, rel, sink, scale, window, left_padding)
 
 
+# Verify-sized query blocks: the band's index arrays depend only on the
+# shapes, so one forward builds them once per (keys, rows, band) and every
+# layer visit reuses them. Reset at the start of each text forward.
+_BAND_MEMO_MAX_ROWS = 16
+_band_memo: dict = {}
+
+
+def reset_band_memo():
+    _band_memo.clear()
+
+
+def _band_index(a0, f, nq, near, r, window, b, hq):
+    dist = (a0 - f) + mx.arange(nq)[:, None] - mx.arange(near)[None, :]
+    gidx = mx.broadcast_to(mx.clip(dist, 0, r - 1), (b, hq, nq, near))
+    vis = dist >= 0
+    if window:
+        vis = vis & (dist < window)
+    return gidx, vis, dist < r
+
+
+@mx.compile
+def _near_mask(bias, vis, in_band, neg):
+    return mx.where(vis, mx.where(in_band, bias, 0), neg).astype(neg.dtype)
+
+
 def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     """MLX SDPA over an additive mask that carries the bias band and sinks."""
     b, hq, length, d = q.shape
@@ -435,14 +460,19 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
         hi = s - length + i1
         f = max(lo, a0 - r + 1)
         near = hi - f
-        dist = (a0 - f) + mx.arange(nq)[:, None] - mx.arange(near)[None, :]
         relq = rel[:, i0:i1].transpose(0, 2, 1, 3)
-        gidx = mx.broadcast_to(mx.clip(dist, 0, r - 1), (b, hq, nq, near))
-        bias = mx.take_along_axis(relq, gidx, axis=-1)
-        vis = dist >= 0
-        if window:
-            vis = vis & (dist < window)
-        near_mask = mx.where(vis, mx.where(dist < r, bias, 0), neg)
+        if length <= _BAND_MEMO_MAX_ROWS:
+            key = (a0, f, nq, near, r, window, b, hq)
+            band = _band_memo.get(key)
+            if band is None:
+                band = _band_memo[key] = _band_index(*key)
+            gidx, vis, in_band = band
+            bias = mx.take_along_axis(relq, gidx, axis=-1)
+            near_mask = _near_mask(bias, vis, in_band, neg)
+        else:
+            gidx, vis, in_band = _band_index(a0, f, nq, near, r, window, b, hq)
+            bias = mx.take_along_axis(relq, gidx, axis=-1)
+            near_mask = mx.where(vis, mx.where(in_band, bias, 0), neg)
         parts = [sink[:, i0:i1].transpose(0, 2, 1)[..., None].astype(q.dtype)]
         if f > lo:
             fill = neg if window else mx.array(0, dtype=q.dtype)
