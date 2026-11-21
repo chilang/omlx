@@ -761,62 +761,42 @@ _nvfp4_rows_kernel = None
 # of the FP32 copy) for every row of the batch.
 _LOOP_GEMV_SOURCE = """
     uint col = threadgroup_position_in_grid.x * 32 + thread_index_in_simdgroup;
-    uint bo = threadgroup_position_in_grid.y;
+    uint bi = threadgroup_position_in_grid.y;
     uint j = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
-    threadgroup float red[8][ROWS][32];
-    float res[ROWS];
-    for (int h = 0; h < PAIR; ++h) {
-        uint bi = bo * PAIR + h;
-        const device bfloat16_t* wp = w + (size_t)bi * K * N + col;
-        const device float* zp = z + (size_t)bi * ROWS * K;
-        float acc[ROWS];
-        for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
-        for (int i = 0; i < K / 32; ++i) {
-            for (int tm = 0; tm < 4; ++tm) {
-                int k = i * 32 + j * 4 + tm;
-                float wv = static_cast<float>(wp[(size_t)k * N]);
-                for (int r = 0; r < ROWS; ++r) {
-                    float vc = zp[r * K + k];
-                    acc[r] += vc * wv;
-                }
-            }
-        }
-        if (h > 0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int r = 0; r < ROWS; ++r) red[j][r][lane] = acc[r];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (j == 0) {
+    const device bfloat16_t* wp = w + (size_t)bi * K * N + col;
+    const device float* zp = z + (size_t)bi * ROWS * K;
+    float acc[ROWS];
+    for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
+    for (int i = 0; i < K / 32; ++i) {
+        for (int tm = 0; tm < 4; ++tm) {
+            int k = i * 32 + j * 4 + tm;
+            float wv = static_cast<float>(wp[(size_t)k * N]);
             for (int r = 0; r < ROWS; ++r) {
-                float p0 = red[0][r][lane], p1 = red[1][r][lane], p2 = red[2][r][lane], p3 = red[3][r][lane];
-                float p4 = red[4][r][lane], p5 = red[5][r][lane], p6 = red[6][r][lane], p7 = red[7][r][lane];
-                float a0 = p0 + p4, a1 = p1 + p5, a2 = p2 + p6, a3 = p3 + p7;
-                float b0 = a0 + a2, b1 = a1 + a3;
-                float c = b0 + b1;
-                res[r] = h == 0 ? c : res[r] + c;
+                float vc = zp[r * K + k];
+                acc[r] += vc * wv;
             }
         }
     }
+    threadgroup float red[8][ROWS][32];
+    for (int r = 0; r < ROWS; ++r) red[j][r][lane] = acc[r];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (j == 0) {
         for (int r = 0; r < ROWS; ++r) {
-            float v = res[r];
-            if (PAIR == 2) {
-                // The halves' sum, rounded to BF16 and widened back.
-                v = static_cast<float>(static_cast<bfloat16_t>(v));
-            }
-            out[((size_t)bo * ROWS + r) * N + col] = v;
+            float p0 = red[0][r][lane], p1 = red[1][r][lane], p2 = red[2][r][lane], p3 = red[3][r][lane];
+            float p4 = red[4][r][lane], p5 = red[5][r][lane], p6 = red[6][r][lane], p7 = red[7][r][lane];
+            float a0 = p0 + p4, a1 = p1 + p5, a2 = p2 + p6, a3 = p3 + p7;
+            float b0 = a0 + a2, b1 = a1 + a3;
+            out[((size_t)bi * ROWS + r) * N + col] = b0 + b1;
         }
     }
 """
 _loop_gemv_kernel = None
 
 
-def loop_gemv(z, w, pair: bool = False):
+def loop_gemv(z, w):
     """``z @ w.astype(float32)`` for ``z`` [B, rows, K] FP32 and ``w`` [B, K, N]
-    BF16, bit-equal to MLX's FP32 matrix-vector product per row.
-
-    ``pair``: also sum batches 2i and 2i + 1 and round the sum to BF16 (held
-    in FP32), as ``_mix_messages`` does with the x and message halves;
-    returns [B / 2, rows, N]."""
+    BF16, bit-equal to MLX's FP32 matrix-vector product per row."""
     global _loop_gemv_kernel
     if _loop_gemv_kernel is None:
         _loop_gemv_kernel = mx.fast.metal_kernel(
@@ -829,10 +809,10 @@ def loop_gemv(z, w, pair: bool = False):
     n = w.shape[-1]
     (out,) = _loop_gemv_kernel(
         inputs=[z, w],
-        template=[("K", k), ("N", n), ("ROWS", rows), ("PAIR", 2 if pair else 1)],
-        grid=((n // 32) * 256, b // 2 if pair else b, 1),
+        template=[("K", k), ("N", n), ("ROWS", rows)],
+        grid=((n // 32) * 256, b, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[(b // 2 if pair else b, rows, n)],
+        output_shapes=[(b, rows, n)],
         output_dtypes=[mx.float32],
     )
     return out
