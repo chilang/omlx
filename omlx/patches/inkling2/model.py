@@ -313,7 +313,7 @@ class Inkling2Experts(nn.Module):
         if (
             self.w13.mode == "nvfp4"
             and self.w2.mode == "nvfp4"
-            and 1 <= inds.shape[0] <= _GROUPED_MAX_ROWS
+            and 2 <= inds.shape[0] <= _GROUPED_MAX_ROWS
         ):
             return self._grouped_nvfp4(x, inds, weights)
         xe = mx.expand_dims(x, (-2, -3))
