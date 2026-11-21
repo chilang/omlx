@@ -430,6 +430,61 @@ def _near_mask(bias, vis, in_band, neg):
     return mx.where(vis, mx.where(in_band, bias, 0), neg).astype(neg.dtype)
 
 
+# Verify-sized blocks: the whole additive mask (sink column, then the keys
+# lo..s-1) in one pass, the same selections as the take/where/concat chain.
+_VERIFY_MASK_SOURCE = """
+    const uint gid = thread_position_in_grid.x;
+    const int W = dims[0], nq = dims[1], hq = dims[2], R = dims[3];
+    const int a0 = dims[4], lo = dims[5], window = dims[6], L = dims[7], i0 = dims[8];
+    const int total = dims[9];
+    if (int(gid) >= total) return;
+    const int c = int(gid) % W;
+    int t = int(gid) / W;
+    const int i = t % nq;
+    t /= nq;
+    const int h = t % hq;
+    const int bb = t / hq;
+    const int qi = i0 + i;
+    T val;
+    if (c == 0) {
+        val = sink[bb * sink_strides[0] + qi * sink_strides[1] + h * sink_strides[2]];
+    } else {
+        const int dist = a0 + i - (lo + c - 1);
+        if (dist < 0 || (window > 0 && dist >= window)) {
+            val = T(-INFINITY);
+        } else if (dist < R) {
+            val = rel[bb * rel_strides[0] + qi * rel_strides[1] + h * rel_strides[2]
+                      + dist * rel_strides[3]];
+        } else {
+            val = T(0);
+        }
+    }
+    out[gid] = val;
+"""
+_verify_mask_kernel = None
+
+
+def _verify_mask(rel, sink, dims, shape):
+    global _verify_mask_kernel
+    if _verify_mask_kernel is None:
+        _verify_mask_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_verify_mask",
+            input_names=["rel", "sink", "dims"],
+            output_names=["out"],
+            source=_VERIFY_MASK_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    total = shape[0] * shape[1] * shape[2] * shape[3]
+    return _verify_mask_kernel(
+        inputs=[rel, sink, dims],
+        template=[("T", rel.dtype)],
+        grid=(((total + 255) // 256) * 256, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[shape],
+        output_dtypes=[rel.dtype],
+    )[0]
+
+
 def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     """MLX SDPA over an additive mask that carries the bias band and sinks."""
     b, hq, length, d = q.shape
@@ -460,6 +515,28 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
         hi = s - length + i1
         f = max(lo, a0 - r + 1)
         near = hi - f
+        if (
+            length <= _BAND_MEMO_MAX_ROWS
+            and rel.dtype == q.dtype
+            and sink.dtype == q.dtype
+            and mx.default_device() == mx.gpu
+        ):
+            key = ("mask", a0, lo, nq, nk, r, window, b, hq, length, i0)
+            dims = _band_memo.get(key)
+            if dims is None:
+                total = b * hq * nq * (nk + 1)
+                dims = _band_memo[key] = mx.array(
+                    [nk + 1, nq, hq, r, a0, lo, window, length, i0, total],
+                    dtype=mx.int32,
+                )
+            mask = _verify_mask(rel, sink, dims, (b, hq, nq, nk + 1))
+            if lp_ok is not None:
+                mask = mx.where(lp_ok, mask, neg)
+            out = mx.fast.scaled_dot_product_attention(
+                q[:, :, i0:i1], kz, vz, scale=scale, mask=mask
+            )
+            outs.append(out)
+            continue
         relq = rel[:, i0:i1].transpose(0, 2, 1, 3)
         if length <= _BAND_MEMO_MAX_ROWS:
             key = (a0, f, nq, near, r, window, b, hq)
