@@ -542,3 +542,138 @@ def route_topk(logits: mx.array, bias: mx.array, top_k: int, route_scale: float)
         output_dtypes=[mx.uint32, mx.float32],
     )
     return inds, weights
+
+
+# Routed NVFP4 expert projection for decode/verify-sized row batches.
+#
+# ``gather_qmm`` (unsorted) runs one mat-vec per (row, expert) pair, so an
+# expert picked by several verify rows is streamed from memory once per row.
+# Here a threadgroup owns one distinct expert and an 8-column output tile: it
+# reads that weight tile once and applies it to every pair routed to the
+# expert. Per pair, the arithmetic is MLX 0.32.4's ``fp_qmv`` traversal for
+# NVFP4 (``fp_quantized.h``: 8 codes per lane, 256-value blocks, the E4M3
+# group scale applied per lane block, then ``simd_sum``), so each output
+# should equal the ``gather_qmm`` output bit for bit; the tests check that.
+_NVFP4_ROWS_SOURCE = """
+    uint p = threadgroup_position_in_grid.y;
+    uint e = sorted_e[p];
+    if (p > 0 && sorted_e[p - 1] == e) {
+        return;
+    }
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int cnt = 1;
+    while (cnt < MAXR && p + cnt < P && sorted_e[p + cnt] == e) {
+        cnt++;
+    }
+    constexpr int KW = K / 8;
+    constexpr int KG = K / 16;
+    int out_row = threadgroup_position_in_grid.x * 8 + simd_gid * 4;
+    const device uint8_t* ws =
+        (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
+    const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    uint dst[MAXR];
+    const device T* xs[MAXR];
+    for (int j = 0; j < MAXR; ++j) {
+        uint pair = order[p + min(j, cnt - 1)];
+        dst[j] = pair;
+        xs[j] = x + (size_t)(pair / SRC_DIV) * K + lane * 8;
+    }
+    float result[MAXR][4];
+    for (int j = 0; j < MAXR; ++j) {
+        for (int r = 0; r < 4; ++r) {
+            result[j][r] = 0.0f;
+        }
+    }
+    for (int k = 0; k < K; k += 256) {
+        if (k + (int)lane * 8 < K) {
+            float s[4];
+            ushort wv[4][2];
+            for (int r = 0; r < 4; ++r) {
+                const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                wv[r][0] = w16[0];
+                wv[r][1] = w16[1];
+                uchar sb = sc[r * KG];
+                ushort v = sb & 127;
+                ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                s[r] = float(as_type<half>(u) * 256.0h);
+            }
+            for (int j = 0; j < MAXR; ++j) {
+                if (j < cnt) {
+                    float xt[8];
+                    for (int i = 0; i < 8; ++i) {
+                        xt[i] = float(xs[j][k + i]);
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        float accum = 0.0f;
+                        for (int i = 0; i < 2; ++i) {
+                            ushort q = wv[r][i];
+                            accum += (xt[4 * i] * fp4v(q) + xt[4 * i + 1] * fp4v(q >> 4) +
+                                      xt[4 * i + 2] * fp4v(q >> 8) + xt[4 * i + 3] * fp4v(q >> 12));
+                        }
+                        result[j][r] += s[r] * accum;
+                    }
+                }
+            }
+        }
+        ws += 128;
+        sc += 16;
+    }
+    for (int j = 0; j < MAXR; ++j) {
+        if (j < cnt) {
+            for (int r = 0; r < 4; ++r) {
+                float v = simd_sum(result[j][r]);
+                if (lane == 0) {
+                    y[(size_t)dst[j] * N + out_row + r] = static_cast<T>(v);
+                }
+            }
+        }
+    }
+"""
+_NVFP4_ROWS_HEADER = """
+inline float fp4v(ushort b) {
+    half c = as_type<half>(ushort((b & 7) << 9));
+    c *= 16384.0h;
+    return float((b & 8) ? -c : c);
+}
+"""
+_nvfp4_rows_kernel = None
+
+
+def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int):
+    """``y[pair] = x[pair // src_div] @ W[expert(pair)]^T`` for NVFP4 experts.
+
+    ``x``: [Q, K] activations; ``w``/``scales``: the [E, N, K/8] uint32 codes
+    and [E, N, K/16] E4M3 scales; ``order``/``sorted_e``: the pairs in expert
+    order and their experts (``argsort`` of the flat routing). ``max_rows``
+    bounds how many pairs share one expert. Returns [P, N] in ``x.dtype``,
+    without the NVFP4 tensor scale (like ``gather_qmm``).
+    """
+    global _nvfp4_rows_kernel
+    if _nvfp4_rows_kernel is None:
+        _nvfp4_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_nvfp4_gather_rows",
+            input_names=["x", "w", "scales", "sorted_e", "order"],
+            output_names=["y"],
+            header=_NVFP4_ROWS_HEADER,
+            source=_NVFP4_ROWS_SOURCE,
+        )
+    pairs = order.shape[0]
+    n = w.shape[1]
+    k = x.shape[-1]
+    (y,) = _nvfp4_rows_kernel(
+        inputs=[x, w, scales, sorted_e, order],
+        template=[
+            ("T", x.dtype),
+            ("K", k),
+            ("N", n),
+            ("P", pairs),
+            ("MAXR", max_rows),
+            ("SRC_DIV", src_div),
+        ],
+        grid=(64 * (n // 8), pairs, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x.dtype],
+    )
+    return y

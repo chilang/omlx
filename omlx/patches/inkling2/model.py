@@ -159,6 +159,11 @@ def _softcapped_swiglu(gate: mx.array, up: mx.array, gcap: mx.array, ucap: mx.ar
     return out.astype(dtype)
 
 
+# Row batches up to this size (speculative verify) take the expert-grouped
+# NVFP4 kernel; its bit-exactness to gather_qmm is tested at 1..8 rows.
+_GROUPED_MAX_ROWS = 8
+
+
 def _gather_sort(x, indices):
     *_, m = indices.shape
     indices = indices.flatten()
@@ -278,7 +283,39 @@ class Inkling2Experts(nn.Module):
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
 
+    def _grouped_nvfp4(self, x, inds, weights):
+        """Verify-sized rows: each distinct expert's weights are read once for
+        all pairs routed to it (``kernels.nvfp4_gather_rows``, bit-exact to
+        ``gather_qmm``)."""
+        rows, top = inds.shape
+        flat = inds.reshape(-1)
+        order = mx.argsort(flat).astype(mx.uint32)
+        sorted_e = flat[order]
+        y = kernels.nvfp4_gather_rows(
+            x, self.w13.weight, self.w13.scales, order, sorted_e, top, rows
+        ).reshape(rows, top, 1, -1)
+        y = y * self.w13.post_scale(inds)[..., None, None].astype(y.dtype)
+        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+        z = kernels.nvfp4_gather_rows(
+            act.reshape(rows * top, -1),
+            self.w2.weight,
+            self.w2.scales,
+            order,
+            sorted_e,
+            1,
+            rows,
+        ).reshape(rows, top, -1)
+        weights = weights * self.w2.post_scale(inds)
+        out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
+        return out.astype(x.dtype)
+
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
+        if (
+            self.w13.mode == "nvfp4"
+            and self.w2.mode == "nvfp4"
+            and 2 <= inds.shape[0] <= _GROUPED_MAX_ROWS
+        ):
+            return self._grouped_nvfp4(x, inds, weights)
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
         idx = inds
