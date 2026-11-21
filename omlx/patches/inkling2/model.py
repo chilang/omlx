@@ -882,10 +882,6 @@ class Model(nn.Module):
 
     # Rows that accept different counts would need a ragged conv rollback.
     _omlx_drafter_single_row = True
-    # Single-row verify forwards run every multi-row quantized projection with
-    # one-row decode arithmetic per row (``row_exact_qmv``): each weight block
-    # is read once for all rows, and verify rows equal decode rows bit for bit.
-    _omlx_mtp_row_exact_verify = True
 
     def mtp_partial_rollback(self, cache, accepted: int, num_drafts: int) -> bool:
         """Drop the rejected drafts of a ``num_drafts + 1``-token verify."""
