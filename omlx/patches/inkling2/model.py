@@ -378,12 +378,15 @@ class AttnResQuery(nn.Module):
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
 
 
-def _mix_messages(x, message, down, gain_forget):
+def _mix_messages(x, message, down, gain_forget, bf16_weights=None):
     """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
 
     ``x`` and ``message`` are [N, B, L, H] FP32, one row per controlled input.
     ``down`` is [N, 2, H, r] (the x and message halves) and ``gain_forget``
-    [N, r, 2H], both FP32 copies of BF16 weights.
+    [N, r, 2H], both FP32 copies of BF16 weights. ``bf16_weights`` holds
+    the same values as BF16 ([2N, H, r] and [N, r, 2H]); decode/verify rows
+    then read those through ``kernels.loop_gemv``, bit-equal per row to the
+    FP32 matrix-vector product at half the weight bytes.
     """
     n, b, length, hidden = x.shape
     rows = b * length
@@ -394,8 +397,11 @@ def _mix_messages(x, message, down, gain_forget):
     z = mx.stack([_unit_rms(x), _unit_rms(message)], axis=1)
     z = z.astype(mx.bfloat16).astype(mx.float32).reshape(2 * n, rows, hidden)
     w = down.reshape(2 * n, hidden, -1)
+    fused = bf16_weights is not None and rows <= _COMPILED_MAX_TOKENS
     per_row = 1 < rows <= _COMPILED_MAX_TOKENS
-    if per_row:
+    if fused:
+        low = kernels.loop_gemv(z, bf16_weights[0])
+    elif per_row:
         # Decode-sized rows: one matrix-vector product per row (a broadcast
         # batch of M=1 matmuls). A few-row matmul gets a GEMM with very few
         # threadgroups (~3.5x the latency), and the per-row kernel is the one
@@ -405,7 +411,9 @@ def _mix_messages(x, message, down, gain_forget):
         low = z @ w
     low = low.reshape(n, 2, rows, -1).sum(axis=1)
     low = low.astype(mx.bfloat16).astype(mx.float32)
-    if per_row:
+    if fused:
+        gates = kernels.loop_gemv(low.reshape(n, rows, -1), bf16_weights[1])
+    elif per_row:
         gates = (low[:, :, None, :] @ gain_forget[:, None]).squeeze(-2)
     else:
         gates = low @ gain_forget
@@ -747,6 +755,7 @@ class Inkling2Layer(nn.Module):
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 self.loop_down[:3],
                 self.loop_gain_forget[:3],
+                self.__dict__.get("_loop_bf16", (None, None))[0],
             )
         if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
@@ -775,6 +784,7 @@ class Inkling2Layer(nn.Module):
                 messages[None, :, :, 3],
                 self.loop_down[3:],
                 self.loop_gain_forget[3:],
+                self.__dict__.get("_loop_bf16", (None, None))[1],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
         m, s3 = _static_conv(
@@ -793,6 +803,20 @@ class Inkling2Layer(nn.Module):
             self._attn_taps = _conv_taps(self.attn_conv)
             self._mlp_taps = _conv_taps(self.mlp_conv)
             mx.eval(*self._attn_taps, *self._mlp_taps, *self.attn.prepare_taps())
+            if "loop_down" in self:
+                # BF16 copies of the FP32 loop controllers (exact: the FP32
+                # copies hold BF16 values) for decode/verify rows.
+                down, gf = self.loop_down, self.loop_gain_forget
+                h_, r_ = down.shape[2], down.shape[3]
+                bf = tuple(
+                    (
+                        mx.contiguous(down[a:b].astype(mx.bfloat16).reshape(-1, h_, r_)),
+                        mx.contiguous(gf[a:b].astype(mx.bfloat16)),
+                    )
+                    for a, b in ((0, 3), (3, 4))
+                )
+                mx.eval(bf)
+                object.__setattr__(self, "_loop_bf16", bf)
         kv = cache[0] if cache is not None else None
         conv = cache[1] if cache is not None else None
         dkv = self.attn.dkv
