@@ -735,13 +735,8 @@ class Inkling2Layer(nn.Module):
                 conv._omlx_verify_xp = dict(enumerate(windows))
             keep = self._conv_k - 1
             for slot, window in enumerate(windows):
-                if compiled:
-                    # A decode/verify window is only K - 1 + length rows, so
-                    # the state keeps a view of it instead of a copy kernel.
-                    conv[slot] = window[:, -keep:]
-                else:
-                    # A small copy, so the state does not pin the chunk's window.
-                    conv[slot] = window[:, -keep:] * 1.0
+                # A small copy, so the state does not pin the chunk's window.
+                conv[slot] = window[:, -keep:] * 1.0
         return h
 
 
