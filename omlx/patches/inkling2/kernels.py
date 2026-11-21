@@ -771,7 +771,7 @@ _LOOP_GEMV_SOURCE = """
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     // Weight loads for UNROLL blocks are issued before their FMAs (the
     // accumulation order is unchanged), so more loads are in flight.
-    constexpr int UNROLL = (K / 32) % 4 == 0 ? 4 : 1;
+    constexpr int UNROLL = (K / 32) % 4 == 0 ? 4 : ((K / 32) % 2 == 0 ? 2 : 1);
     for (int i0 = 0; i0 < K / 32; i0 += UNROLL) {
         float wv[UNROLL][4];
         for (int u = 0; u < UNROLL; ++u) {
