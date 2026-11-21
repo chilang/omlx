@@ -415,30 +415,41 @@ def _mix_messages(x, message, down, gain_forget):
     return (1.0 - forget) * x + gain * message
 
 
-def _static_conv(x, w, state, scale):
-    """Depthwise causal conv (taps: ``w[:, K-1]`` is the current token).
+def _conv_taps(w):
+    """FP32 copies of a [C, K] depthwise conv weight's taps, one contiguous
+    [C] array per lag.
+
+    The FP32 values equal the promoted weight, so the conv is unchanged; the
+    taps no longer need a strided slice and a cast kernel each per call.
+    """
+    return tuple(mx.contiguous(w[:, j].astype(mx.float32)) for j in range(w.shape[-1]))
+
+
+def _static_conv(x, taps, state, scale, wdtype):
+    """Depthwise causal conv (``taps[K-1]`` is the current token).
 
     Returns the output and the padded input window ``[state, x]``; its last
     ``K - 1`` rows are the next state.
     """
     xf = x.astype(mx.float32)
-    k = w.shape[-1]
+    k = len(taps)
     xp = mx.concatenate([state, xf], axis=1)
     length = xf.shape[1]
-    out = w[:, 0] * xp[:, 0:length]
+    out = taps[0] * xp[:, 0:length]
     for j in range(1, k):
-        out = out + w[:, j] * xp[:, j : j + length]
+        out = out + taps[j] * xp[:, j : j + length]
     # The reference rounds the depthwise conv to the weight dtype before the
     # residual add.
-    out = (out.astype(w.dtype).astype(mx.float32) + xf) * scale
+    out = (out.astype(wdtype).astype(mx.float32) + xf) * scale
     return out.astype(x.dtype), xp
 
 
 def _dynamic_conv(x, dyn, static_w, state, heads, scale):
-    """Per-token taps ``static_w[lag] + dyn[head, lag]`` over k/v channels."""
+    """Per-token taps ``static_w[lag] + dyn[head, lag]`` over k/v channels
+    (``static_w``: one FP32 [C] array per lag)."""
     xf = x.astype(mx.float32)
     b, length, c = xf.shape
-    k = static_w.shape[0]
+    k = len(static_w)
     xp = mx.concatenate([state, xf], axis=1)
     dyn = dyn.astype(mx.float32).reshape(b, length, heads, 1, k)
     out = None
@@ -499,6 +510,17 @@ class Inkling2Attention(nn.Module):
         self._one = mx.array(1.0, dtype=mx.float32)
         self._sconv_scale = 1.0 / math.sqrt(self.conv_k + 1)
         self._dconv_scale = 1.0 / math.sqrt(2 * self.conv_k + 1)
+        self._k_taps = self._v_taps = None
+
+    def prepare_taps(self):
+        if self.sliding:
+            self._k_taps = _conv_taps(self.k_conv)
+            self._v_taps = _conv_taps(self.v_conv)
+        else:
+            # Already [K, C]; the FP32 copy equals the promoted weight.
+            self._k_taps = _conv_taps(self.k_static.T)
+            self._v_taps = _conv_taps(self.v_static.T)
+        return [*self._k_taps, *self._v_taps]
 
     def log_tau(self, kv, length: int):
         """Query/relative-state log scaling for long positions (full layers)."""
@@ -530,8 +552,12 @@ class Inkling2Attention(nn.Module):
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
                 k = pk[..., self._cuts[0] : self._cuts[1]]
                 v = pv[..., self._cuts[1] : self._cuts[2]]
-            k, ks = _static_conv(k, self.k_conv, ks, self._sconv_scale)
-            v, vs = _static_conv(v, self.v_conv, vs, self._sconv_scale)
+            k, ks = _static_conv(
+                k, self._k_taps, ks, self._sconv_scale, self.k_conv.dtype
+            )
+            v, vs = _static_conv(
+                v, self._v_taps, vs, self._sconv_scale, self.v_conv.dtype
+            )
         else:
             q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
@@ -539,7 +565,7 @@ class Inkling2Attention(nn.Module):
             k, ks = _dynamic_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
-                self.k_static,
+                self._k_taps,
                 ks,
                 self.n_kv,
                 self._dconv_scale,
@@ -547,7 +573,7 @@ class Inkling2Attention(nn.Module):
             v, vs = _dynamic_conv(
                 vp[..., :dkv],
                 vp[..., dkv:],
-                self.v_static,
+                self._v_taps,
                 vs,
                 self.n_kv,
                 self._dconv_scale,
@@ -648,6 +674,7 @@ class Inkling2Layer(nn.Module):
         self.mlp_conv = mx.zeros((h, args.sconv_kernel_size))
         self._conv_scale = 1.0 / math.sqrt(args.sconv_kernel_size + 1)
         self._conv_k = args.sconv_kernel_size
+        self._attn_taps = self._mlp_taps = None
         # A weak proxy: compiled bound methods would make each layer a
         # reference cycle, so a released model would wait for the cyclic GC.
         layer = weakref.proxy(self)
@@ -685,7 +712,9 @@ class Inkling2Layer(nn.Module):
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
         a = self.attn.output(out, gate)
-        a, s2 = _static_conv(a, self.attn_conv, s2, self._conv_scale)
+        a, s2 = _static_conv(
+            a, self._attn_taps, s2, self._conv_scale, self.attn_conv.dtype
+        )
         if self.is_boundary:
             residual = a.astype(mx.float32)
         else:
@@ -699,7 +728,9 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[3:],
             )[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
-        m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
+        m, s3 = _static_conv(
+            m, self._mlp_taps, s3, self._conv_scale, self.mlp_conv.dtype
+        )
         return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
 
     def __call__(self, h, blocks, cache=None, bank=None):
@@ -707,6 +738,12 @@ class Inkling2Layer(nn.Module):
         FP32 completed blocks; extended in place at a block boundary.
         ``bank``: the previous loop pass's ``(blocks, partial_n)`` messages."""
         b, length, hidden = h.shape
+        if self._attn_taps is None:
+            # After the weights are loaded and before any compiled trace, so
+            # the traces capture the taps as constants.
+            self._attn_taps = _conv_taps(self.attn_conv)
+            self._mlp_taps = _conv_taps(self.mlp_conv)
+            mx.eval(*self._attn_taps, *self._mlp_taps, *self.attn.prepare_taps())
         kv = cache[0] if cache is not None else None
         conv = cache[1] if cache is not None else None
         dkv = self.attn.dkv
