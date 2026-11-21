@@ -357,7 +357,8 @@ def _mix_messages(x, message, down, gain_forget):
     z = mx.stack([_unit_rms(x), _unit_rms(message)], axis=1)
     z = z.astype(mx.bfloat16).astype(mx.float32).reshape(2 * n, rows, hidden)
     w = down.reshape(2 * n, hidden, -1)
-    if 1 < rows <= _COMPILED_MAX_TOKENS:
+    per_row = 1 < rows <= _COMPILED_MAX_TOKENS
+    if per_row:
         # Decode-sized rows: one matrix-vector product per row (a broadcast
         # batch of M=1 matmuls). A few-row matmul gets a GEMM with very few
         # threadgroups (~3.5x the latency), and the per-row kernel is the one
@@ -367,7 +368,11 @@ def _mix_messages(x, message, down, gain_forget):
         low = z @ w
     low = low.reshape(n, 2, rows, -1).sum(axis=1)
     low = low.astype(mx.bfloat16).astype(mx.float32)
-    gates = (low @ gain_forget).reshape(n, b, length, 2 * hidden)
+    if per_row:
+        gates = (low[:, :, None, :] @ gain_forget[:, None]).squeeze(-2)
+    else:
+        gates = low @ gain_forget
+    gates = gates.reshape(n, b, length, 2 * hidden)
     gain = mx.tanh(gates[..., :hidden])
     forget = mx.tanh(gates[..., hidden:])
     return (1.0 - forget) * x + gain * message
