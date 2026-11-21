@@ -768,13 +768,23 @@ _LOOP_GEMV_SOURCE = """
     const device float* zp = z + (size_t)bi * ROWS * K;
     float acc[ROWS];
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
-    for (int i = 0; i < K / 32; ++i) {
-        for (int tm = 0; tm < 4; ++tm) {
-            int k = i * 32 + j * 4 + tm;
-            float wv = static_cast<float>(wp[(size_t)k * N]);
-            for (int r = 0; r < ROWS; ++r) {
-                float vc = zp[r * K + k];
-                acc[r] += vc * wv;
+    // Weight loads for UNROLL blocks are issued before their FMAs (the
+    // accumulation order is unchanged), so more loads are in flight.
+    constexpr int UNROLL = (K / 32) % 4 == 0 ? 4 : 1;
+    for (int i0 = 0; i0 < K / 32; i0 += UNROLL) {
+        float wv[UNROLL][4];
+        for (int u = 0; u < UNROLL; ++u) {
+            for (int tm = 0; tm < 4; ++tm) {
+                wv[u][tm] = static_cast<float>(wp[(size_t)((i0 + u) * 32 + j * 4 + tm) * N]);
+            }
+        }
+        for (int u = 0; u < UNROLL; ++u) {
+            for (int tm = 0; tm < 4; ++tm) {
+                int k = (i0 + u) * 32 + j * 4 + tm;
+                for (int r = 0; r < ROWS; ++r) {
+                    float vc = zp[r * K + k];
+                    acc[r] += vc * wv[u][tm];
+                }
             }
         }
     }
