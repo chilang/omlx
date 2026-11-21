@@ -588,11 +588,16 @@ _NVFP4_ROWS_SOURCE = """
     for (int k = 0; k < K; k += 256) {
         if (k + (int)lane * 8 < K) {
             float s[4];
-            ushort wv[4][2];
+            float wd[4][8];
             for (int r = 0; r < 4; ++r) {
                 const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
-                wv[r][0] = w16[0];
-                wv[r][1] = w16[1];
+                for (int i = 0; i < 2; ++i) {
+                    ushort q = w16[i];
+                    wd[r][4 * i] = fp4v(q);
+                    wd[r][4 * i + 1] = fp4v(q >> 4);
+                    wd[r][4 * i + 2] = fp4v(q >> 8);
+                    wd[r][4 * i + 3] = fp4v(q >> 12);
+                }
                 uchar sb = sc[r * KG];
                 ushort v = sb & 127;
                 ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
@@ -607,9 +612,8 @@ _NVFP4_ROWS_SOURCE = """
                     for (int r = 0; r < 4; ++r) {
                         float accum = 0.0f;
                         for (int i = 0; i < 2; ++i) {
-                            ushort q = wv[r][i];
-                            accum += (xt[4 * i] * fp4v(q) + xt[4 * i + 1] * fp4v(q >> 4) +
-                                      xt[4 * i + 2] * fp4v(q >> 8) + xt[4 * i + 3] * fp4v(q >> 12));
+                            accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                                      xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
                         }
                         result[j][r] += s[r] * accum;
                     }
