@@ -760,10 +760,11 @@ _nvfp4_rows_kernel = None
 # consecutive output columns, so each weight row is read once (half the bytes
 # of the FP32 copy) for every row of the batch.
 _LOOP_GEMV_SOURCE = """
-    uint col = threadgroup_position_in_grid.x * 32 + thread_index_in_simdgroup;
+    uint t = thread_position_in_threadgroup.x;
+    uint lane = t % CPT;
+    uint j = t / CPT;
+    uint col = threadgroup_position_in_grid.x * CPT + lane;
     uint bi = threadgroup_position_in_grid.y;
-    uint j = simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
     const device bfloat16_t* wp = w + (size_t)bi * K * N + col;
     const device float* zp = z + (size_t)bi * ROWS * K;
     float acc[ROWS];
@@ -788,7 +789,7 @@ _LOOP_GEMV_SOURCE = """
             }
         }
     }
-    threadgroup float red[8][ROWS][32];
+    threadgroup float red[8][ROWS][CPT];
     for (int r = 0; r < ROWS; ++r) red[j][r][lane] = acc[r];
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (j == 0) {
@@ -817,11 +818,14 @@ def loop_gemv(z, w):
         )
     b, rows, k = z.shape
     n = w.shape[-1]
+    # Narrow outputs (the down projection) take 8-column threadgroups so the
+    # work spreads over more GPU cores; one thread per (partial, column).
+    cpt = 8 if n <= 256 else 32
     (out,) = _loop_gemv_kernel(
         inputs=[z, w],
-        template=[("K", k), ("N", n), ("ROWS", rows)],
-        grid=((n // 32) * 256, b, 1),
-        threadgroup=(256, 1, 1),
+        template=[("K", k), ("N", n), ("ROWS", rows), ("CPT", cpt)],
+        grid=((n // cpt) * 8 * cpt, b, 1),
+        threadgroup=(8 * cpt, 1, 1),
         output_shapes=[(b, rows, n)],
         output_dtypes=[mx.float32],
     )
