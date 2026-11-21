@@ -400,7 +400,8 @@ def _mix_messages(x, message, down, gain_forget, bf16_weights=None):
     fused = bf16_weights is not None and rows <= _COMPILED_MAX_TOKENS
     per_row = 1 < rows <= _COMPILED_MAX_TOKENS
     if fused:
-        low = kernels.loop_gemv(z, bf16_weights[0])
+        # The kernel also adds the x and message halves and rounds to BF16.
+        low = kernels.loop_gemv(z, bf16_weights[0], pair=True)
     elif per_row:
         # Decode-sized rows: one matrix-vector product per row (a broadcast
         # batch of M=1 matmuls). A few-row matmul gets a GEMM with very few
@@ -409,8 +410,9 @@ def _mix_messages(x, message, down, gain_forget, bf16_weights=None):
         low = (z[:, :, None, :] @ w[:, None]).squeeze(-2)
     else:
         low = z @ w
-    low = low.reshape(n, 2, rows, -1).sum(axis=1)
-    low = low.astype(mx.bfloat16).astype(mx.float32)
+    if not fused:
+        low = low.reshape(n, 2, rows, -1).sum(axis=1)
+        low = low.astype(mx.bfloat16).astype(mx.float32)
     if fused:
         gates = kernels.loop_gemv(low.reshape(n, rows, -1), bf16_weights[1])
     elif per_row:
