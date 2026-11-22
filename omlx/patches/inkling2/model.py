@@ -569,6 +569,11 @@ _MK_OPROJ_ROWS = os.environ.get("OMLX_INKLING2_MK_OPROJ_ROWS", "") == "1"
 _MK_ROUTE_ROWS = os.environ.get("OMLX_INKLING2_MK_ROUTE_ROWS", "") == "1"
 # Megakernel slice 19: affine 4-bit expert layers, each distinct expert read once (1..8 rows).
 _MK_AFFINE = os.environ.get("OMLX_INKLING2_MK_AFFINE", "") == "1"
+_MK_ACTIVE = sorted(k for k, v in os.environ.items() if k.startswith("OMLX_INKLING2_MK_") and v not in ("", "0"))
+if _MK_ACTIVE:
+    import logging as _logging
+
+    _logging.getLogger(__name__).warning("Inkling 2 megakernel flags active: %s", " ".join(_MK_ACTIVE))
 # NOT bit-exact vs the incumbent (equal to the 1-row decode path per row): verify router logits as R
 # independent 1-row GEMVs instead of MLX's multi-row matmul (OMLX_INKLING2_MK_ROUTER_PERROW=1).
 _MK_ROUTER_PERROW = os.environ.get("OMLX_INKLING2_MK_ROUTER_PERROW", "") == "1"
