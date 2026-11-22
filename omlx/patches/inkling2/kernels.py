@@ -1517,3 +1517,203 @@ def scaled_swiglu(y, global_scale, inds, inv_den, caps, sdiv=1):
         output_dtypes=[y.dtype],
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Megakernel slice 1 (OMLX_INKLING2_MK_MOE=1): the single-token MoE tail in two
+# dispatches instead of six. Per element the arithmetic is the incumbent's:
+#   ups   = nvfp4_gather_rows(w13) (exact variant) + scaled_swiglu;
+#   downs = nvfp4_gather_rows(w2) (exact) + moe_combine + static conv (decode)
+#           + ``(residual + conv).astype(T)``, and the next MLP conv state.
+# Only the intermediate y / z / m round-trips through device memory go away.
+# ---------------------------------------------------------------------------
+_NVFP4_DOT_BODY = """
+    // MLX fp_qmv traversal for NVFP4 of 4 rows (``_NVFP4_ROWS_SOURCE``, one pair).
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < KD; k += 256) {
+        if (k + (int)lane * 8 < KD) {
+            float s[4];
+            float wd[4][8];
+            for (int r = 0; r < 4; ++r) {
+                const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                for (int i = 0; i < 2; ++i) {
+                    ushort q = w16[i];
+                    wd[r][4 * i] = fp4v(q);
+                    wd[r][4 * i + 1] = fp4v(q >> 4);
+                    wd[r][4 * i + 2] = fp4v(q >> 8);
+                    wd[r][4 * i + 3] = fp4v(q >> 12);
+                }
+                uchar sb = sc[r * KG];
+                ushort v = sb & 127;
+                ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                s[r] = float(as_type<half>(u) * 256.0h);
+            }
+            float xt[8];
+            for (int i = 0; i < 8; ++i) {
+                xt[i] = float(xs[k + i]);
+            }
+            for (int r = 0; r < 4; ++r) {
+                float accum = 0.0f;
+                for (int i = 0; i < 2; ++i) {
+                    accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                              xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
+                }
+                result[r] += s[r] * accum;
+            }
+        }
+        ws += 128;
+        sc += 16;
+    }
+    T z[4];
+    for (int r = 0; r < 4; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
+"""
+
+# grid (64 * (2I / 8), TOP), threadgroup 64: simdgroup g of threadgroup x owns
+# w13 rows x*8 + g*4 .. +3 = (gate, up) of intermediate columns x*4 + g*2, +1.
+_MK_UPS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint p = threadgroup_position_in_grid.y;
+    uint e = inds[p];
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    constexpr int KD = H;
+    constexpr int N = 2 * I;
+    constexpr int KW = KD / 8;
+    constexpr int KG = KD / 16;
+    int out_row = threadgroup_position_in_grid.x * 8 + simd_gid * 4;
+    const device uint8_t* ws =
+        (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
+    const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    const device T* xs = x + lane * 8;
+""" + _NVFP4_DOT_BODY + """
+    if (lane < 2) {
+        float g = static_cast<float>(z[2 * lane]);
+        float u = static_cast<float>(z[2 * lane + 1]);
+        float sv = gs[e] * inv_den[0];
+        float sb = static_cast<float>(static_cast<bfloat16_t>(sv));
+        g = static_cast<float>(static_cast<T>(g * sb));
+        u = static_cast<float>(static_cast<T>(u * sb));
+        const float gc = caps[0], uc = caps[1];
+        float sg = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+        sg = (g < 0.0f) ? sg : 1.0f - sg;
+        float a = metal::precise::tanh(g / gc) * gc;
+        a = a * sg;
+        float b = metal::precise::tanh(u / uc) * uc;
+        act[(size_t)p * I + out_row / 2 + lane] = static_cast<T>(a * b);
+    }
+"""
+
+# grid (32 * TOP, H / 4), threadgroup 32 * TOP: simdgroup j = pick j, all four
+# output rows y*4 .. +3; then 4 lanes of simdgroup 0 combine the picks in order,
+# run the decode conv tail and the residual add for those 4 columns.
+_MK_DOWNS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint j = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint e = inds[j];
+    constexpr int KD = I;
+    constexpr int N = H;
+    constexpr int KW = KD / 8;
+    constexpr int KG = KD / 16;
+    int out_row = threadgroup_position_in_grid.y * 4;
+    const device uint8_t* ws =
+        (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
+    const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    const device T* xs = act + (size_t)j * I + lane * 8;
+""" + _NVFP4_DOT_BODY + """
+    threadgroup float tz[TOP][4];
+    if (lane == 0) {
+        for (int r = 0; r < 4; ++r) tz[j][r] = static_cast<float>(z[r]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (j == 0 && lane < 4) {
+        uint c = out_row + lane;
+        float total = 0.0f;
+        for (int t = 0; t < TOP; ++t) {
+            float wj = wts[t];
+            float s = gs[inds[t]] * inv_den[0];
+            wj = wj * s;
+            if (COMBINE_FMA) {
+                total = metal::fma(tz[t][lane], wj, total);
+            } else {
+                float pr = tz[t][lane] * wj;
+                total = pr + total;
+            }
+        }
+        T xm = static_cast<T>(total);
+        // Decode static conv (static_conv_prefill at L = 1).
+        float rr[KT];
+        for (int t = 0; t < KT - 1; ++t) rr[t] = state[(size_t)t * H + c];
+        rr[KT - 1] = static_cast<float>(xm);
+        float o = taps[c] * rr[0];
+        for (int t = 1; t < KT; ++t) {
+            float tt = taps[(size_t)t * H + c] * rr[t];
+            o = o + tt;
+        }
+        float y = (static_cast<float>(static_cast<W>(o)) + rr[KT - 1]) * cscale[0];
+        T m = static_cast<T>(y);
+        hout[c] = static_cast<T>(residual[c] + static_cast<float>(m));
+        for (int t = 0; t < KT - 1; ++t) next_state[(size_t)t * H + c] = rr[t + 1];
+    }
+"""
+_mk_ups_kernel = None
+_mk_downs_kernel = None
+# 0 = plain multiply then add (bit-equal to the incumbent moe_combine on 16 chained
+# r1 steps, tools/mk_equal.py); 1 = explicit fma (differs).
+MK_COMBINE_FMA = 0
+
+
+def mk_moe_ups(x, w, scales, inds, gs, inv_den, caps):
+    """x [1, H] bf16, w13 [E, 2I, H/8] u32, inds [1, TOP] -> act [TOP, I]."""
+    global _mk_ups_kernel
+    if _mk_ups_kernel is None:
+        _mk_ups_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_ups",
+            input_names=["x", "w", "scales", "inds", "gs", "inv_den", "caps"],
+            output_names=["act"],
+            header=_NVFP4_ROWS_HEADER,
+            source=_MK_UPS_SOURCE,
+        )
+    top = inds.size
+    n2 = w.shape[1]
+    h = x.shape[-1]
+    (act,) = _mk_ups_kernel(
+        inputs=[x, w, scales, inds.reshape(-1), gs, mx.array([inv_den], dtype=mx.float32), caps],
+        template=[("T", x.dtype), ("H", h), ("I", n2 // 2)],
+        grid=(64 * (n2 // 8), top, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(top, n2 // 2)],
+        output_dtypes=[x.dtype],
+    )
+    return act
+
+
+def mk_moe_downs(act, w, scales, inds, weights, gs, inv_den, residual, state, taps, cscale, wdtype):
+    """act [TOP, I], w2 [E, H, I/8], weights [1, TOP] f32, residual [1, 1, H]
+    f32, state [1, K-1, H] f32, taps [K, H] f32. Returns (h [1, 1, H] act.dtype,
+    next state [1, K-1, H] f32)."""
+    global _mk_downs_kernel
+    if _mk_downs_kernel is None:
+        _mk_downs_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_downs",
+            input_names=["act", "w", "scales", "inds", "wts", "gs", "inv_den",
+                         "residual", "state", "taps", "cscale"],
+            output_names=["hout", "next_state"],
+            header=_NVFP4_ROWS_HEADER,
+            source=_MK_DOWNS_SOURCE,
+        )
+    top, i = act.shape
+    h = w.shape[1]
+    kt = taps.shape[0]
+    hout, nxt = _mk_downs_kernel(
+        inputs=[act, w, scales, inds.reshape(-1), weights.reshape(-1), gs,
+                mx.array([inv_den], dtype=mx.float32), residual.reshape(-1),
+                mx.contiguous(state), taps, mx.array([cscale], dtype=mx.float32)],
+        template=[("T", act.dtype), ("W", wdtype), ("H", h), ("I", i), ("TOP", top),
+                  ("KT", kt), ("COMBINE_FMA", MK_COMBINE_FMA)],
+        grid=(32 * top, h // 4, 1),
+        threadgroup=(32 * top, 1, 1),
+        output_shapes=[(1, 1, h), (1, kt - 1, h)],
+        output_dtypes=[act.dtype, mx.float32],
+    )
+    return hout, nxt

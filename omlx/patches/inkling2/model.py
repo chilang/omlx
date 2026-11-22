@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import math
+import os
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -517,6 +518,8 @@ _FUSED_PREFILL_GLUE = True
 # Single-token decode takes the same conv kernel (output and next state in one
 # dispatch). Verify widths (2..16 rows) keep the ops: rollback needs the window.
 _FUSED_DECODE_CONV = True
+# Megakernel slice 1: single-token MoE tail as ups + downs kernels (default off).
+_MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "") == "1"
 _taps_stacked: dict = {}
 
 
@@ -924,11 +927,44 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[3:],
                 self.__dict__.get("_loop_bf16", (None, None))[1],
             )[0]
-        m = self.mlp(self.mlp_norm(y).astype(h.dtype))
+        x_mlp = self.mlp_norm(y).astype(h.dtype)
+        if _MK_MOE and self._mk_moe_ok(x_mlp, s3):
+            h_out, s3 = self._mk_moe(x_mlp, residual, s3)
+            return h_out, s2, s3
+        m = self.mlp(x_mlp)
         m, s3 = _static_conv(
             m, self._mlp_taps, s3, self._conv_scale, self.mlp_conv.dtype
         )
         return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3
+
+    def _mk_moe_ok(self, x, s3):
+        ex = self.mlp.experts
+        return (
+            x.size == x.shape[-1]
+            and ex.w13.mode == "nvfp4"
+            and ex.w2.mode == "nvfp4"
+            and s3.dtype == mx.float32
+            and mx.default_device() == mx.gpu
+            and self.mlp.router_weight.shape[0] % 32 == 0
+        )
+
+    def _mk_moe(self, x, residual, s3):
+        """Single-token MoE + MLP conv + residual add in four dispatches
+        (router GEMV, top-k, ups, downs); same arithmetic as the stock path."""
+        mlp = self.mlp
+        ex = mlp.experts
+        flat = x.reshape(1, -1)
+        logits = flat.astype(mx.float32) @ mlp.router_weight.T
+        inds, w = kernels.route_topk(logits, mlp.router_bias, mlp.top_k, mlp.route_scale)
+        inv = 1.0 / _NVFP4_DENOMINATOR
+        act = kernels.mk_moe_ups(
+            flat, ex.w13.weight, ex.w13.scales, inds, ex.w13.global_scale, inv, ex._caps
+        )
+        h_out, s3 = kernels.mk_moe_downs(
+            act, ex.w2.weight, ex.w2.scales, inds, w, ex.w2.global_scale, inv,
+            residual, s3, _stacked(self._mlp_taps), self._conv_scale, self.mlp_conv.dtype,
+        )
+        return h_out.reshape(x.shape), s3
 
     def __call__(self, h, blocks, cache=None, bank=None):
         """``h``: partial block sum [B, L, H] bf16. ``blocks``: list of unit-RMS
