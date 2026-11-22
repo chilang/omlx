@@ -896,6 +896,10 @@ class Inkling2Layer(nn.Module):
         return h
 
 
+# Verify forwards dispatch their graph every this many layer visits (0: off).
+_DISPATCH_EVERY = 8
+
+
 class Inkling2TextModel(nn.Module):
     def __init__(self, args: TextArgs, quant: dict | None = None):
         super().__init__()
@@ -935,6 +939,9 @@ class Inkling2TextModel(nn.Module):
                 f"({self.num_visits}), got {len(cache)}"
             )
         kernels.reset_band_memo()
+        # Speculative verify forwards are built after the cycle's host sync,
+        # with nothing else queued on the GPU: dispatch them in pieces.
+        pipelined = _DISPATCH_EVERY > 0 and 1 < h.shape[0] * h.shape[1] <= _COMPILED_MAX_TOKENS
         blocks: list = []
         prelude = bank = None
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
@@ -951,6 +958,10 @@ class Inkling2TextModel(nn.Module):
             if capture is not None and visit in capture:
                 capture[visit] = h
             h = self.layers[idx](h, blocks, cache=c, bank=bank if loop_pass else None)
+            if pipelined and visit % _DISPATCH_EVERY == _DISPATCH_EVERY - 1:
+                # Start the GPU on the layers built so far while the host
+                # builds the rest (same kernels, so the same results).
+                mx.async_eval(h)
         x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
         out = self.norm(x).astype(h.dtype)
         if capture is not None and self.num_visits in capture:
