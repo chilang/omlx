@@ -520,6 +520,8 @@ _FUSED_PREFILL_GLUE = True
 _FUSED_DECODE_CONV = True
 # Megakernel slice 1: single-token MoE tail as ups + downs kernels (default off).
 _MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "") == "1"
+# Megakernel slice 2: single-token gated o_proj + attention conv + residual.
+_MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
 _taps_stacked: dict = {}
 
 
@@ -905,15 +907,42 @@ class Inkling2Layer(nn.Module):
             xv = self.v_input_norm(xv).astype(dtype)
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
-    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
-        a = self.attn.output(out, gate)
-        a, s2 = _static_conv(
-            a, self._attn_taps, s2, self._conv_scale, self.attn_conv.dtype
+    def _mk_oproj_ok(self, out, h, s2):
+        o = self.attn.o_proj
+        return (
+            _MK_OPROJ
+            and h.size == h.shape[-1]
+            and out.dtype == mx.bfloat16
+            and h.dtype == mx.bfloat16
+            and s2.dtype == mx.float32
+            and isinstance(o, nn.QuantizedLinear)
+            and getattr(o, "mode", "affine") == "affine"
+            and o.bits == 8
+            and "bias" not in o
+            and o.scales.dtype == mx.bfloat16
+            and out.size % 256 == 0
+            and o.weight.shape[0] % 8 == 0
+            and mx.default_device() == mx.gpu
         )
-        if self.is_boundary:
-            residual = a.astype(mx.float32)
+
+    def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
+        if self._mk_oproj_ok(out, h, s2):
+            # One dispatch: gated o_proj + attention conv + residual.
+            o = self.attn.o_proj
+            residual, s2 = kernels.mk_oproj(
+                out, mx.sigmoid(gate.astype(mx.float32)), o.weight, o.scales, o.biases,
+                o.group_size, s2, _stacked(self._attn_taps), self._conv_scale,
+                self.attn_conv.dtype, h, self.is_boundary,
+            )
         else:
-            residual = h.astype(mx.float32) + a.astype(mx.float32)
+            a = self.attn.output(out, gate)
+            a, s2 = _static_conv(
+                a, self._attn_taps, s2, self._conv_scale, self.attn_conv.dtype
+            )
+            if self.is_boundary:
+                residual = a.astype(mx.float32)
+            else:
+                residual = h.astype(mx.float32) + a.astype(mx.float32)
         if residual.shape[0] * residual.shape[1] <= _COMPILED_MAX_TOKENS:
             q = self.mlp_input
             y = kernels.attn_res_mix_raw(mlp_blocks, residual, q.query, q.scale)[0][:, :, 0]

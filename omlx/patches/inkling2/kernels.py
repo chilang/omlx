@@ -1717,3 +1717,111 @@ def mk_moe_downs(act, w, scales, inds, weights, gs, inv_den, residual, state, ta
         output_dtypes=[act.dtype, mx.float32],
     )
     return hout, nxt
+
+
+# ---------------------------------------------------------------------------
+# Megakernel slice 2 (OMLX_INKLING2_MK_OPROJ=1): single-token attention output
+# in one dispatch: x = bf16(attn * sigmoid(gate)) on load (sigmoid precomputed
+# off the critical path), MLX 0.32.4 ``qmv_fast_impl`` for 8-bit affine
+# (2 simdgroups x 4 rows, 8 values per lane, ``scale * accum + sum * bias``,
+# simd_sum, cast), then the static conv (decode) and the residual in FP32.
+# ---------------------------------------------------------------------------
+_MK_OPROJ_SOURCE = """
+#pragma METAL fp contract(off)
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    constexpr int VPT = 8;
+    constexpr int BLOCK = VPT * 32;
+    constexpr int KW = K;            // bytes per weight row (8-bit)
+    constexpr int KG = K / GS;
+    constexpr int SSTEP = GS / VPT;
+    int out_row = threadgroup_position_in_grid.y * 8 + simd_gid * 4;
+    const device uint8_t* ws = (const device uint8_t*)w + (size_t)out_row * KW + simd_lid * VPT;
+    const device T* sl0 = scales + (size_t)out_row * KG + simd_lid / SSTEP;
+    const device T* bl0 = biases + (size_t)out_row * KG + simd_lid / SSTEP;
+    const device T* xa = attn + simd_lid * VPT;
+    const device float* xg = sg + simd_lid * VPT;
+    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int k = 0; k < K; k += BLOCK) {
+        float xt[VPT];
+        float sum = 0.0f;
+        for (int i = 0; i < VPT; ++i) {
+            T xv = static_cast<T>(static_cast<float>(xa[k + i]) * xg[k + i]);
+            sum += static_cast<float>(xv);
+            xt[i] = static_cast<float>(xv);
+        }
+        for (int r = 0; r < 4; ++r) {
+            const device uint8_t* wl = ws + r * KW;
+            float s = static_cast<float>(sl0[r * KG]);
+            float b = static_cast<float>(bl0[r * KG]);
+            float accum = 0.0f;
+            if (VAR & 2) {
+                for (int i = 0; i < VPT; ++i) accum = metal::fma(xt[i], static_cast<float>(wl[i]), accum);
+            } else {
+                for (int i = 0; i < VPT; ++i) accum += xt[i] * wl[i];
+            }
+            if (VAR & 1) {
+                result[r] += metal::fma(s, accum, sum * b);
+            } else if (VAR & 4) {
+                result[r] = metal::fma(sum, b, s * accum) + result[r];
+            } else {
+                result[r] += s * accum + sum * b;
+            }
+        }
+        ws += BLOCK;
+        sl0 += BLOCK / GS;
+        bl0 += BLOCK / GS;
+    }
+    for (int r = 0; r < 4; ++r) {
+        float v = simd_sum(result[r]);
+        if (simd_lid == 0) {
+            uint c = out_row + r;
+            T a = static_cast<T>(v);
+            float rr[KT];
+            for (int t = 0; t < KT - 1; ++t) rr[t] = state[(size_t)t * N + c];
+            rr[KT - 1] = static_cast<float>(a);
+            float o = taps[c] * rr[0];
+            for (int t = 1; t < KT; ++t) {
+                float tt = taps[(size_t)t * N + c] * rr[t];
+                o = o + tt;
+            }
+            float y = (static_cast<float>(static_cast<W>(o)) + rr[KT - 1]) * cscale[0];
+            T m = static_cast<T>(y);
+            residual[c] = BOUND ? static_cast<float>(m)
+                                : static_cast<float>(h[c]) + static_cast<float>(m);
+            for (int t = 0; t < KT - 1; ++t) next_state[(size_t)t * N + c] = rr[t + 1];
+        }
+    }
+"""
+_mk_oproj_kernel = None
+# 1 = fma(scale, accum, sum * bias), as MLX 0.32.4's precompiled qmv rounds (tools/mk_unit.py: 20/20 equal; 0 and 4 differ)
+MK_OPROJ_VAR = 1
+
+
+def mk_oproj(attn, sg, w, scales, biases, group_size, state, taps, cscale, wdtype, h, boundary):
+    """attn [.., K] bf16 (row-contiguous; the SDPA output of one row), sg [.., K]
+    FP32 sigmoid(gate), 8-bit affine o_proj (w [N, K/4] u32, scales/biases
+    [N, K/GS]), state [1, KT-1, N] FP32, taps [KT, N] FP32, h [1, 1, N].
+    Returns (residual [1, 1, N] FP32, next state [1, KT-1, N] FP32)."""
+    global _mk_oproj_kernel
+    if _mk_oproj_kernel is None:
+        _mk_oproj_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_oproj",
+            input_names=["attn", "sg", "w", "scales", "biases", "state", "taps", "cscale", "h"],
+            output_names=["residual", "next_state"],
+            source=_MK_OPROJ_SOURCE,
+        )
+    n = w.shape[0]
+    k = attn.size
+    kt = taps.shape[0]
+    residual, nxt = _mk_oproj_kernel(
+        inputs=[attn.reshape(-1), sg.reshape(-1), w, scales, biases, mx.contiguous(state), taps,
+                mx.array([cscale], dtype=mx.float32), h.reshape(-1)],
+        template=[("T", attn.dtype), ("W", wdtype), ("K", k), ("N", n), ("GS", group_size),
+                  ("KT", kt), ("BOUND", int(boundary)), ("VAR", MK_OPROJ_VAR)],
+        grid=(64, n // 8, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(1, 1, n), (1, kt - 1, n)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return residual, nxt
