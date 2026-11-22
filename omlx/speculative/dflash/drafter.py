@@ -93,13 +93,6 @@ def _concat_captured(captured: Sequence[mx.array]) -> mx.array:
     return mx.concatenate(list(captured), axis=-1)
 
 
-import os as _os
-
-# Megakernel round: DSpark drafts run lm_head (and the Markov steps) only on the
-# rows the depth verifies (OMLX_INKLING2_MK_DRAFT_ROWS=1; bit-exact proposals).
-_DRAFT_ROWS = _os.environ.get("OMLX_INKLING2_MK_DRAFT_ROWS", "") == "1"
-
-
 class DFlashDrafter:
     """Row-wise DFlash drafting against per-request context caches."""
 
@@ -854,13 +847,7 @@ class DFlashDrafter:
         draft_hidden = model.norm(h) if anchor_slot else model.norm(h)[:, 1:]
         if wide:
             draft_hidden = draft_hidden.astype(dtype)
-        markov = getattr(model, "markov_head", None)
-        if _DRAFT_ROWS and markov is not None and 0 < self.depth < draft_hidden.shape[1]:
-            # Rows past the depth are never proposed (``_proposal_count`` <= depth);
-            # MLX's lm_head rows are equal at any row count (measured 2/3 vs 7/8 rows).
-            logits = model._logits(draft_hidden[:, : self.depth])
-        else:
-            logits = model._logits(draft_hidden)
+        logits = model._logits(draft_hidden)
         samplers = [sampler for *_, sampler in rows]
         selector = getattr(model, "candidate_selector", None)
         if markov is not None:
