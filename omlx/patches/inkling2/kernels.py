@@ -507,8 +507,9 @@ _VERIFY_MASK_SOURCE = """
     const int W = dims[0], nq = dims[1], hq = dims[2], R = dims[3];
     const int a0 = dims[4], lo = dims[5], window = dims[6], L = dims[7], i0 = dims[8];
     const int total = dims[9];
+    const int sc = dims[10];  // 1: column 0 carries the sink logit; 0: keys only
     if (int(gid) >= total) return;
-    const int c = int(gid) % W;
+    const int c = int(gid) % W + (1 - sc);
     int t = int(gid) / W;
     const int i = t % nq;
     t /= nq;
@@ -555,6 +556,9 @@ def _verify_mask(rel, sink, dims, shape):
     )[0]
 
 
+_FOLDED_VERIFY = True
+
+
 def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
     """MLX SDPA over an additive mask that carries the bias band and sinks."""
     b, hq, length, d = q.shape
@@ -591,12 +595,36 @@ def _masked_attention(q, k, v, rel, sink, scale, window, left_padding):
             and sink.dtype == q.dtype
             and mx.default_device() == mx.gpu
         ):
+            if _FOLDED_VERIFY and b == 1 and lp_ok is None:
+                # One query per (head, row): MLX's single-query SDPA with a
+                # per-(head, row) sink reads K/V in place (no zero sink row
+                # concatenated onto the whole window).
+                key = ("fold", a0, lo, nq, nk, r, window, b, hq, length, i0)
+                dims = _band_memo.get(key)
+                if dims is None:
+                    total = b * hq * nq * nk
+                    dims = _band_memo[key] = mx.array(
+                        [nk, nq, hq, r, a0, lo, window, length, i0, total, 0],
+                        dtype=mx.int32,
+                    )
+                mask = _verify_mask(rel, sink, dims, (b, hq, nq, nk))
+                sinks = sink[0, i0:i1].transpose(1, 0).reshape(-1)
+                out = mx.fast.scaled_dot_product_attention(
+                    q[:, :, i0:i1].reshape(b, hq * nq, 1, d),
+                    k[:, :, lo:],
+                    v[:, :, lo:],
+                    scale=scale,
+                    mask=mask.reshape(b, hq * nq, 1, nk),
+                    sinks=sinks,
+                )
+                outs.append(out.reshape(b, hq, nq, d))
+                continue
             key = ("mask", a0, lo, nq, nk, r, window, b, hq, length, i0)
             dims = _band_memo.get(key)
             if dims is None:
                 total = b * hq * nq * (nk + 1)
                 dims = _band_memo[key] = mx.array(
-                    [nk + 1, nq, hq, r, a0, lo, window, length, i0, total],
+                    [nk + 1, nq, hq, r, a0, lo, window, length, i0, total, 1],
                     dtype=mx.int32,
                 )
             mask = _verify_mask(rel, sink, dims, (b, hq, nq, nk + 1))
