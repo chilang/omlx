@@ -299,7 +299,7 @@ class Inkling2Experts(nn.Module):
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
         self._caps = mx.array([args.mlp_gate_softcap, args.mlp_up_softcap], dtype=mx.float32)
 
-    def _grouped_nvfp4(self, x, inds, weights, order=None, sorted_e=None):
+    def _grouped_nvfp4(self, x, inds, weights, order=None, sorted_e=None, return_z=False):
         """Verify-sized rows: each distinct expert's weights are read once for
         all pairs routed to it (``kernels.nvfp4_gather_rows``, bit-exact to
         ``gather_qmm``)."""
@@ -329,6 +329,8 @@ class Inkling2Experts(nn.Module):
             1,
             rows,
         ).reshape(rows, top, -1)
+        if return_z:
+            return z
         if rows <= _COMPILED_MAX_TOKENS:
             return kernels.moe_combine(
                 z, weights, inds, self.w2.global_scale, 1.0 / _NVFP4_DENOMINATOR, x.dtype
@@ -527,6 +529,8 @@ _MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "") == "1"
 _MK_PREP_FULL = os.environ.get("OMLX_INKLING2_MK_PREP_FULL", "1") != "0"
 # Megakernel slice 11: sliding prep at verify widths (2..16 rows).
 _MK_PREP_ROWS = os.environ.get("OMLX_INKLING2_MK_PREP_ROWS", "") == "1"
+# Megakernel slice 12: verify-width MoE tail (combine + MLP conv + residual) in one kernel.
+_MK_MOE_ROWS = os.environ.get("OMLX_INKLING2_MK_MOE_ROWS", "") == "1"
 # Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
 _MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
@@ -1105,6 +1109,20 @@ class Inkling2Layer(nn.Module):
             h_out, s3 = self._mk_moe(x_mlp.reshape(h.shape), residual, s3, logits)
             return h_out, s2, s3
         x_mlp = self.mlp_norm(y).astype(h.dtype)
+        ex = self.mlp.experts
+        if (
+            _MK_MOE_ROWS and x_mlp.shape[0] == 1 and 2 <= x_mlp.shape[1] <= _GROUPED_MAX_ROWS
+            and ex.w13.mode == "nvfp4" and ex.w2.mode == "nvfp4" and s3.dtype == mx.float32
+            and mx.default_device() == mx.gpu and self.mlp.router_weight.shape[0] % 32 == 0
+        ):
+            flat = x_mlp.reshape(-1, x_mlp.shape[-1])
+            inds, w = self.mlp.route(flat)
+            z = ex._grouped_nvfp4(flat, inds, w, return_z=True)
+            h_out, s3 = kernels.mk_moe_tail_rows(
+                z, w, inds, ex.w2.global_scale, 1.0 / _NVFP4_DENOMINATOR, residual, s3,
+                _stacked(self._mlp_taps), self._conv_scale, self.mlp_conv.dtype,
+            )
+            return h_out, s2, s3
         if _MK_MOE and self._mk_moe_ok(x_mlp, s3):
             h_out, s3 = self._mk_moe(x_mlp, residual, s3)
             return h_out, s2, s3

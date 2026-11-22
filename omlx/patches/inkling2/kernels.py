@@ -2370,3 +2370,68 @@ def mk_prep_rows(qs, q0, qst, r0, ks_, k0, kst_r, vs_, v0, vst_r, length, qscale
         output_dtypes=[qs.dtype] * 4 + [mx.float32, mx.float32],
     )
     return tuple(outs)
+
+
+# Megakernel slice 12 (OMLX_INKLING2_MK_MOE_ROWS=1): verify-width MoE tail in
+# one kernel, one thread per hidden column over the L rows: the top-k combine
+# (``moe_combine``: products then in-order sum, cast), the MLP static conv over
+# [state, m] (window written whole for the rollback), the residual add.
+_MK_TAIL_ROWS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint c = thread_position_in_grid.x;
+    if (c >= H) return;
+    float win[KT - 1 + L];
+    for (int t = 0; t < KT - 1; ++t) win[t] = state[(size_t)t * H + c];
+    for (int l = 0; l < L; ++l) {
+        float total = 0.0f;
+        for (int j = 0; j < TOP; ++j) {
+            float wj = w[l * TOP + j];
+            float s = gs[inds[l * TOP + j]] * inv_den[0];
+            wj = wj * s;
+            float pr = static_cast<float>(z[((size_t)l * TOP + j) * H + c]) * wj;
+            total = pr + total;
+        }
+        win[KT - 1 + l] = static_cast<float>(static_cast<T>(total));
+    }
+    for (int t = 0; t < KT - 1 + L; ++t) window[(size_t)t * H + c] = win[t];
+    for (int l = 0; l < L; ++l) {
+        float o = taps[c] * win[l];
+        for (int t = 1; t < KT; ++t) {
+            if (CFMA) o = metal::fma(taps[(size_t)t * H + c], win[l + t], o);
+            else { float tt = taps[(size_t)t * H + c] * win[l + t]; o = o + tt; }
+        }
+        float xf = win[l + KT - 1];
+        float y = (static_cast<float>(static_cast<W>(o)) + xf) * cscale[0];
+        T m = static_cast<T>(y);
+        hout[(size_t)l * H + c] = static_cast<T>(residual[(size_t)l * H + c] + static_cast<float>(m));
+    }
+"""
+_mk_tail_rows_kernel = None
+MK_TAIL_ROWS_CFMA = 0
+
+
+def mk_moe_tail_rows(z, weights, inds, gs, inv_den, residual, state, taps, cscale, wdtype):
+    """z [L, TOP, H] expert outputs (no tensor scale), weights/inds [L, TOP],
+    residual [1, L, H] FP32, state [1, KT-1, H] FP32, taps [KT, H] FP32.
+    Returns (h [1, L, H] z.dtype, window [1, KT-1+L, H] FP32)."""
+    global _mk_tail_rows_kernel
+    if _mk_tail_rows_kernel is None:
+        _mk_tail_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_tail_rows",
+            input_names=["z", "w", "inds", "gs", "inv_den", "residual", "state", "taps", "cscale"],
+            output_names=["hout", "window"],
+            source=_MK_TAIL_ROWS_SOURCE,
+        )
+    length, top, h = z.shape
+    kt = taps.shape[0]
+    hout, win = _mk_tail_rows_kernel(
+        inputs=[z, weights, inds, gs, mx.array([inv_den], dtype=mx.float32), residual.reshape(-1),
+                mx.contiguous(state), taps, mx.array([cscale], dtype=mx.float32)],
+        template=[("T", z.dtype), ("W", wdtype), ("H", h), ("L", length), ("TOP", top), ("KT", kt),
+                  ("CFMA", MK_TAIL_ROWS_CFMA)],
+        grid=(h, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, length, h), (1, kt - 1 + length, h)],
+        output_dtypes=[z.dtype, mx.float32],
+    )
+    return hout, win
