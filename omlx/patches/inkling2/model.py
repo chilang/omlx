@@ -139,6 +139,26 @@ def _unit_rms(x: mx.array, eps: float = 1e-6) -> mx.array:
     return mx.fast.rms_norm(x, None, eps)
 
 
+def _small_rows(x: mx.array) -> bool:
+    return x.ndim == 3 and x.shape[0] * x.shape[1] <= _COMPILED_MAX_TOKENS
+
+
+def _unit_rms_of(x: mx.array) -> mx.array:
+    """``_unit_rms(x.astype(float32))``; decode/verify rows read ``x`` in the
+    norm kernel instead of a separate cast (bit-identical)."""
+    if _small_rows(x):
+        return kernels.rms_cast(x, None, 1e-6, mx.float32)
+    return _unit_rms(x.astype(mx.float32))
+
+
+def _norm_to(norm, x: mx.array, dtype) -> mx.array:
+    """``norm(x).astype(dtype)``; for FP32 decode/verify rows one kernel
+    (FP32 arithmetic as in ``mx.fast.rms_norm``, so bit-identical)."""
+    if x.dtype == mx.float32 and _small_rows(x):
+        return kernels.rms_cast(x, norm.weight, norm.eps, dtype)
+    return norm(x).astype(dtype)
+
+
 def _softcap(x: mx.array, cap: float) -> mx.array:
     return mx.tanh(x / cap) * cap
 
@@ -763,7 +783,7 @@ class Inkling2Layer(nn.Module):
 
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
-        h_n = _unit_rms(h.astype(mx.float32))
+        h_n = _unit_rms_of(h)
         if self.layer_idx == 0:
             xq = xk = xv = h
         else:
@@ -781,14 +801,14 @@ class Inkling2Layer(nn.Module):
                 self.__dict__.get("_loop_bf16", (None, None))[0],
             )
         if self.sliding and messages is None:
-            xq = self.attn_norm(xq).astype(dtype)
+            xq = _norm_to(self.attn_norm, xq, dtype)
             xk = xv = None
         elif self.sliding:
-            xq, xk, xv = (self.attn_norm(x).astype(dtype) for x in (xq, xk, xv))
+            xq, xk, xv = (_norm_to(self.attn_norm, x, dtype) for x in (xq, xk, xv))
         else:
-            xq = self.q_input_norm(xq).astype(dtype)
-            xk = self.k_input_norm(xk).astype(dtype)
-            xv = self.v_input_norm(xv).astype(dtype)
+            xq = _norm_to(self.q_input_norm, xq, dtype)
+            xk = _norm_to(self.k_input_norm, xk, dtype)
+            xv = _norm_to(self.v_input_norm, xv, dtype)
         return (*self.attn.project(xq, xk, xv, ks, vs, tau), h_n)
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
@@ -809,7 +829,7 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[3:],
                 self.__dict__.get("_loop_bf16", (None, None))[1],
             )[0]
-        m = self.mlp(self.mlp_norm(y).astype(h.dtype))
+        m = self.mlp(_norm_to(self.mlp_norm, y, h.dtype))
         m, s3 = _static_conv(
             m, self._mlp_taps, s3, self._conv_scale, self.mlp_conv.dtype
         )
@@ -925,14 +945,14 @@ class Inkling2TextModel(nn.Module):
                 # the last pass wrote become its message bank.
                 bank = (
                     blocks[len(prelude[1]) + 1 :],
-                    _unit_rms(h.astype(mx.float32)),
+                    _unit_rms_of(h),
                 )
                 h, blocks = prelude[0], list(prelude[1])
             if capture is not None and visit in capture:
                 capture[visit] = h
             h = self.layers[idx](h, blocks, cache=c, bank=bank if loop_pass else None)
-        x = self.final_input(blocks, _unit_rms(h.astype(mx.float32)))[:, :, 0]
-        out = self.norm(x).astype(h.dtype)
+        x = self.final_input(blocks, _unit_rms_of(h))[:, :, 0]
+        out = _norm_to(self.norm, x, h.dtype)
         if capture is not None and self.num_visits in capture:
             capture[self.num_visits] = out
         return out

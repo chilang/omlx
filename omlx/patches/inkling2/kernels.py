@@ -1000,3 +1000,89 @@ def moe_combine(z, weights, inds, global_scale, inv_den, out_dtype):
         output_dtypes=[out_dtype],
     )
     return out
+
+
+# RMS norm with the casts around it fused in: ``rms_norm(x.astype(f32), w)``
+# cast to ``OUT``. Same arithmetic as MLX's ``rms_single_row`` for an FP32
+# input (four consecutive elements per thread, simd_sum, threadgroup sum,
+# precise rsqrt), so the result is bit-identical to the stock ops.
+_RMS_CAST_SOURCE = """
+    constexpr int NR = 4;
+    uint gid = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_lane_id = thread_index_in_simdgroup;
+    uint simd_group_id = simdgroup_index_in_threadgroup;
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
+    size_t base = elem_to_loc((size_t)gid * D, x_shape, x_strides, x_ndim);
+    float xv[NR];
+    float acc = 0;
+    if (lid * NR + NR <= D) {
+        for (int i = 0; i < NR; i++) {
+            xv[i] = static_cast<float>(x[base + lid * NR + i]);
+            acc += xv[i] * xv[i];
+        }
+    } else {
+        for (int i = 0; i < NR; i++) {
+            if ((lid * NR + i) < D) {
+                xv[i] = static_cast<float>(x[base + lid * NR + i]);
+                acc += xv[i] * xv[i];
+            }
+        }
+    }
+    acc = simd_sum(acc);
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / D + eps[0]);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = local_inv_mean[0];
+    for (int i = 0; i < NR; i++) {
+        int c = lid * NR + i;
+        if (c < D) {
+            float y = xv[i] * inv;
+            if (HAS_W) {
+                y = static_cast<float>(w[c]) * y;
+            }
+            out[(size_t)gid * D + c] = static_cast<OUT>(y);
+        }
+    }
+"""
+_rms_cast_kernel = None
+
+
+def rms_cast(x, weight, eps: float, out_dtype):
+    """``mx.fast.rms_norm(x.astype(float32), weight, eps).astype(out_dtype)``
+    in one kernel (``weight`` FP32 or None; last axis contiguous)."""
+    global _rms_cast_kernel
+    if _rms_cast_kernel is None:
+        _rms_cast_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_rms_cast",
+            input_names=["x", "w", "eps"],
+            output_names=["out"],
+            source=_RMS_CAST_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    d = x.shape[-1]
+    rows = x.size // d
+    has_w = weight is not None
+    tg = ((d + 3) // 4 + 31) // 32 * 32
+    (out,) = _rms_cast_kernel(
+        inputs=[x, weight if has_w else mx.zeros((1,), mx.float32), mx.array([eps], dtype=mx.float32)],
+        template=[("OUT", out_dtype), ("D", d), ("HAS_W", int(has_w))],
+        grid=(tg * rows, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[out_dtype],
+    )
+    return out
