@@ -1904,8 +1904,8 @@ _MK_ROUTER_SOURCE = """
     constexpr int NB = NIT + (LEFT > 0 ? 1 : 0);
     int out_row = threadgroup_position_in_grid.x * TM;
     const device float* mat = rw + (size_t)out_row * H;
-    float wv[NB][TM][TN];
-    for (int i = 0; i < NB; ++i) {
+    float wv[PRE ? NB : 1][TM][TN];
+    for (int i = 0; PRE && i < NB; ++i) {
         int bn = (int)(sg * SN + lane) * TN + i * BLOCKN;
         for (int tm = 0; tm < TM; ++tm)
             for (int tn = 0; tn < TN; ++tn)
@@ -1924,8 +1924,12 @@ _MK_ROUTER_SOURCE = """
         }
         for (int tm = 0; tm < TM; ++tm)
             for (int tn = 0; tn < TN; ++tn) {
-                if (FMA) result[tm] = metal::fma(wv[i][tm][tn], vc[tn], result[tm]);
-                else { float pr = wv[i][tm][tn] * vc[tn]; result[tm] = result[tm] + pr; }
+                {
+                    float wq = PRE ? wv[PRE ? i : 0][tm][tn]
+                                   : ((bn + tn < H) ? mat[(size_t)tm * H + bn + tn] : 0.0f);
+                    if (FMA) result[tm] = metal::fma(wq, vc[tn], result[tm]);
+                    else { float pr = wq * vc[tn]; result[tm] = result[tm] + pr; }
+                }
             }
     }
     for (int tm = 0; tm < TM; ++tm)
@@ -1950,6 +1954,8 @@ _MK_ROUTER_SOURCE = """
 _mk_router_kernel = None
 # 1 = fma accumulation: bit-equal to MLX's precompiled fp32 gemv (tools/mk_unit.py 20/20; plain mul+add 0/20)
 MK_ROUTER_FMA = 1
+# 1: router rows loaded before the norm (mk-4); 0: loaded in the GEMV loop.
+MK_ROUTER_PRE = 0
 
 
 def mk_router(y, norm_w, router_w):
@@ -1967,7 +1973,7 @@ def mk_router(y, norm_w, router_w):
     e = router_w.shape[0]
     x, logits = _mk_router_kernel(
         inputs=[y.reshape(-1), norm_w.astype(mx.float32), router_w],
-        template=[("H", h), ("TG", 256), ("FMA", MK_ROUTER_FMA)],
+        template=[("H", h), ("TG", 256), ("FMA", MK_ROUTER_FMA), ("PRE", MK_ROUTER_PRE)],
         grid=(256 * (e // 4), 1, 1),
         threadgroup=(256, 1, 1),
         output_shapes=[(1, h), (1, e)],
