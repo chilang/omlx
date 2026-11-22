@@ -1159,7 +1159,9 @@ def loop_mix_up(parts, w, x, message):
     n, b, length, h = x.shape
     rows = b * length
     k = parts.shape[-1]
-    cpt = 32 if rows <= 8 else 16
+    # Narrow threadgroups: this latency-bound kernel needs many of them
+    # (each thread already computes both the gain and the forget column).
+    cpt = 8
     (out,) = _loop_mix_up_kernel(
         inputs=[parts, w, x, message],
         template=[("K", k), ("H", h), ("N2", 2 * h), ("ROWS", rows), ("CPT", cpt)],
