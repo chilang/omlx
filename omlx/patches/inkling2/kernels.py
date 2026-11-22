@@ -2054,3 +2054,143 @@ def mk_prep(src, offs, qscale, rscale, thr, ktaps, vtaps, kst, vst, cscale, wdty
         output_dtypes=[src.dtype] * 4 + [mx.float32, mx.float32],
     )
     return tuple(outs)
+
+
+# Megakernel slice 9 (OMLX_INKLING2_MK_PREP=1 on full-attention visits): the
+# global layer's epilogue: q clip (q_scale) x tau; k/v dynamic conv (static tap
+# + projected per-head tap, ``model._dynamic_conv`` order), k clip, v unit RMS;
+# r clip x tau and the reversed relative bias. Separate q/k/v sources.
+_MK_PREP_FULL_SOURCE = """
+#pragma METAL fp contract(off)
+    uint task = threadgroup_position_in_grid.y;
+    uint lane = thread_index_in_simdgroup;
+    const float tq = thr[0];
+    const float tr = thr[1];
+    const float ta = tau[0];
+    if (task < HQ) {
+        uint h = task;
+        float v[4];
+        float total = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            uint i = h * D + lane * 4 + j;
+            v[j] = static_cast<float>(qsrc[i]) * static_cast<float>(qscale[i]);
+            if (CLIPFMA) total = metal::fma(v[j], v[j], total);
+            else { float sq = v[j] * v[j]; total = sq + total; }
+        }
+        total = simd_sum(total);
+        float m = metal::min(tq / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+        for (int j = 0; j < 4; ++j) {
+            float qc = static_cast<float>(static_cast<T>(v[j] * m));
+            qout[h * D + lane * 4 + j] = static_cast<T>(qc * ta);
+        }
+        return;
+    }
+    if (task < HQ + 2 * HKV) {
+        bool isk = task < HQ + HKV;
+        uint h = isk ? task - HQ : task - HQ - HKV;
+        const device T* src = isk ? ksrc : vsrc;
+        const device float* st = isk ? kst : vst;
+        const device float* tp = isk ? ktaps : vtaps;
+        float dyn[KT];
+        for (int lag = 0; lag < KT; ++lag) dyn[lag] = static_cast<float>(src[C + h * KT + lag]);
+        float cv[4];
+        for (int j = 0; j < 4; ++j) {
+            uint c = h * D + lane * 4 + j;
+            float rr[KT];
+            for (int t = 0; t < KT - 1; ++t) rr[t] = st[(size_t)t * C + c];
+            float xf = static_cast<float>(src[c]);
+            rr[KT - 1] = xf;
+            float out = 0.0f;
+            for (int lag = 0; lag < KT; ++lag) {
+                float tap = tp[(size_t)lag * C + c] + dyn[lag];
+                float wv = rr[KT - 1 - lag];
+                if (lag == 0) out = wv * tap;
+                else if (DFMA) out = metal::fma(wv, tap, out);
+                else { float term = wv * tap; out = out + term; }
+            }
+            float y = (out + xf) * cscale[0];
+            cv[j] = static_cast<float>(static_cast<T>(y));
+            if (isk) for (int t = 0; t < KT - 1; ++t) knext[(size_t)t * C + c] = rr[t + 1];
+            else for (int t = 0; t < KT - 1; ++t) vnext[(size_t)t * C + c] = rr[t + 1];
+        }
+        if (isk) {
+            float total = 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                if (CLIPFMA) total = metal::fma(cv[j], cv[j], total);
+                else { float sq = cv[j] * cv[j]; total = sq + total; }
+            }
+            total = simd_sum(total);
+            float m = metal::min(tq / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+            for (int j = 0; j < 4; ++j) kout[h * D + lane * 4 + j] = static_cast<T>(cv[j] * m);
+        } else {
+            float racc = 0.0f;
+            for (int j = 0; j < 4; ++j) {
+                if (RMSFMA) racc = metal::fma(cv[j], cv[j], racc);
+                else { float sq = cv[j] * cv[j]; racc = racc + sq; }
+            }
+            racc = simd_sum(racc);
+            float tot = simd_sum(lane == 0 ? racc : 0.0f);
+            float inv = metal::precise::rsqrt(tot / D + 1e-6f);
+            for (int j = 0; j < 4; ++j) vout[h * D + lane * 4 + j] = static_cast<T>(cv[j] * inv);
+        }
+        return;
+    }
+    uint idx = task - HQ - 2 * HKV;
+    uint h = idx / RCH;
+    uint chunk = idx % RCH;
+    float rv = 0.0f;
+    if (lane < DR) rv = static_cast<float>(qsrc[R0 + h * DR + lane]) * static_cast<float>(rscale[h * DR + lane]);
+    float sq = rv * rv;
+    float total = 0.0f;
+    for (int i = 0; i < DR; ++i) {
+        float si = simd_shuffle(sq, (ushort)i);
+        total = si + total;
+    }
+    float m = metal::min(tr / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+    float rc = static_cast<float>(static_cast<T>(rv * m));
+    rc = static_cast<float>(static_cast<T>(rc * ta));
+    for (int it = 0; it < 8; ++it) {
+        uint d = chunk * 256 + it * 32 + lane;
+        float acc = 0.0f;
+        for (int k = 0; k < DR; ++k) {
+            float rk = simd_shuffle(rc, (ushort)k);
+            acc = metal::fma(rk, static_cast<float>(relp[(size_t)k * NREL + d]), acc);
+        }
+        if (d < NREL) relrev[h * NREL + (NREL - 1 - d)] = static_cast<T>(acc);
+    }
+"""
+_mk_prep_full_kernel = None
+MK_PREP_DFMA = 0
+
+
+def mk_prep_full(qsrc, ksrc, vsrc, r0, tau, qscale, rscale, thr, ktaps, vtaps, kst, vst, cscale, relp, hq, hkv, d, dr):
+    """Full-attention visit epilogue. qsrc [.., q|r|gate|sink] (r at ``r0``),
+    ksrc/vsrc [.., C + HKV*KT] (values then per-head dynamic taps), tau [1] FP32.
+    Returns (q, k, v, relrev, k next, v next) as ``mk_prep``."""
+    global _mk_prep_full_kernel
+    if _mk_prep_full_kernel is None:
+        _mk_prep_full_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_prep_full",
+            input_names=["qsrc", "ksrc", "vsrc", "tau", "qscale", "rscale", "thr", "ktaps", "vtaps", "kst", "vst", "cscale", "relp"],
+            output_names=["qout", "kout", "vout", "relrev", "knext", "vnext"],
+            source=_MK_PREP_FULL_SOURCE,
+        )
+    nrel = relp.shape[1]
+    rch = (nrel + 255) // 256
+    c = hkv * d
+    kt = ktaps.shape[0]
+    outs = _mk_prep_full_kernel(
+        inputs=[qsrc.reshape(-1), ksrc.reshape(-1), vsrc.reshape(-1), tau.reshape(-1).astype(mx.float32),
+                qscale.reshape(-1).astype(mx.float32), rscale.reshape(-1).astype(mx.float32),
+                thr, ktaps, vtaps, mx.contiguous(kst), mx.contiguous(vst),
+                mx.array([cscale], dtype=mx.float32), relp],
+        template=[("T", qsrc.dtype), ("HQ", hq), ("HKV", hkv), ("D", d), ("DR", dr),
+                  ("C", c), ("KT", kt), ("NREL", nrel), ("RCH", rch), ("R0", r0),
+                  ("CLIPFMA", MK_PREP_CLIPFMA), ("RMSFMA", MK_PREP_RMSFMA), ("DFMA", MK_PREP_DFMA)],
+        grid=(32, hq + 2 * hkv + hq * rch, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(1, hq, 1, d), (1, hkv, 1, d), (1, hkv, 1, d), (1, hq, 1, nrel),
+                       (1, kt - 1, c), (1, kt - 1, c)],
+        output_dtypes=[qsrc.dtype] * 4 + [mx.float32, mx.float32],
+    )
+    return tuple(outs)

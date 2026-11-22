@@ -524,6 +524,7 @@ _MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "") == "1"
 _MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
 # Megakernel slice 6: sliding single-token projection epilogue in one kernel.
 _MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "") == "1"
+_MK_PREP_FULL = os.environ.get("OMLX_INKLING2_MK_PREP_FULL", "1") != "0"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
 _MK_ROUTER = os.environ.get("OMLX_INKLING2_MK_ROUTER", "") == "1"
 _taps_stacked: dict = {}
@@ -729,6 +730,12 @@ class Inkling2Attention(nn.Module):
             and self.rel_extent == self.window and self.head_dim == 128 and self.d_rel <= 32
         ):
             return self._mk_project(xq, xk, xv, ks, vs)
+        if (
+            _MK_PREP and _MK_PREP_FULL and not self.sliding and b == 1 and length == 1 and tau is not None
+            and xq.dtype == mx.bfloat16 and ks.dtype == mx.float32 and vs.dtype == mx.float32
+            and self.head_dim == 128 and self.d_rel <= 32
+        ):
+            return self._mk_project_full(xq, xk, xv, ks, vs, tau)
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(_proj(self.in_proj, xq), self._cuts, axis=-1)
@@ -829,6 +836,21 @@ class Inkling2Attention(nn.Module):
         sink = qrow[..., c[4] :]
         return q, k, v, relrev, gate, sink, ks, vs
 
+    def _mk_project_full(self, xq, xk, xv, ks, vs, tau):
+        c = self._cuts
+        qp = _proj(self.q_proj, xq)
+        kp = _proj(self.k_proj, xk)
+        vp = _proj(self.v_proj, xv)
+        q, k, v, relrev, ks, vs = kernels.mk_prep_full(
+            qp, kp, vp, c[0], tau, self.q_scale, self.r_scale,
+            mx.concatenate([self._qk_clip.reshape(1), self._r_clip.reshape(1)]),
+            _stacked(self._k_taps), _stacked(self._v_taps), ks, vs, self._dconv_scale,
+            self.rel_proj.astype(qp.dtype), self.n_heads, self.n_kv, self.head_dim, self.d_rel,
+        )
+        gate = qp[..., c[1] : c[2]]
+        sink = qp[..., c[2] :]
+        return q, k, v, relrev, gate, sink, ks, vs
+
     def attend(self, q, k, v, rel, sink, kv):
         if (
             rel.shape[1] == self.n_heads and rel.shape[1] != 1 and q.shape[2] == 1
@@ -842,7 +864,13 @@ class Inkling2Attention(nn.Module):
                 k = k[:, :, lo:]
                 v = v[:, :, lo:]
             sv = s - lo
-            mask = rel[..., rel.shape[-1] - sv :]
+            nrel = rel.shape[-1]
+            if sv <= nrel:
+                mask = rel[..., nrel - sv :]
+            else:
+                mask = mx.concatenate(
+                    [mx.zeros((*rel.shape[:-1], sv - nrel), dtype=rel.dtype), rel], axis=-1
+                )
             return mx.fast.scaled_dot_product_attention(
                 q, k, v, scale=self.scale, mask=mask, sinks=sink[0, 0].astype(q.dtype)
             )
