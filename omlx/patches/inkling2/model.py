@@ -341,6 +341,16 @@ class Inkling2Experts(nn.Module):
             y = y * s13[..., None, None].astype(y.dtype)
         act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
         z = self.w2(act, idx, do_sort)
+        if do_sort and _FUSED_PREFILL_GLUE and inds.shape[0] > _COMPILED_MAX_TOKENS:
+            return kernels.moe_combine_sorted(
+                z,
+                inv,
+                weights,
+                inds,
+                self.w2.global_scale if self.w2.mode == "nvfp4" else None,
+                1.0 / _NVFP4_DENOMINATOR,
+                x.dtype,
+            )
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
@@ -465,6 +475,19 @@ def _conv_taps(w):
     return tuple(mx.contiguous(w[:, j].astype(mx.float32)) for j in range(w.shape[-1]))
 
 
+# Prefill rows (> _COMPILED_MAX_TOKENS, batch 1) run the static conv and the
+# routed-expert combine as single kernels (bit-equal to the ops below).
+_FUSED_PREFILL_GLUE = True
+_taps_stacked: dict = {}
+
+
+def _stacked(taps):
+    hit = _taps_stacked.get(id(taps))
+    if hit is None or hit[0] is not taps:
+        hit = _taps_stacked[id(taps)] = (taps, mx.stack(taps))
+    return hit[1]
+
+
 def _static_conv(x, taps, state, scale, wdtype):
     """Depthwise causal conv (``taps[K-1]`` is the current token).
 
@@ -473,6 +496,15 @@ def _static_conv(x, taps, state, scale, wdtype):
     next state and reads the window rows from ``state`` and ``x`` directly,
     so no concatenation sits in front of the conv.
     """
+    if (
+        _FUSED_PREFILL_GLUE
+        and x.shape[0] == 1
+        and x.shape[1] > _COMPILED_MAX_TOKENS
+        and state.dtype == mx.float32
+    ):
+        # The second result holds only the next state (the window's last
+        # K - 1 rows), which is all a prefill chunk keeps.
+        return kernels.static_conv_prefill(x, _stacked(taps), state, scale, wdtype)
     xf = x.astype(mx.float32)
     k = len(taps)
     length = xf.shape[1]

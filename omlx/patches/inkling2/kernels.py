@@ -1297,3 +1297,116 @@ def loop_mix_up(parts, w, x, message):
         output_dtypes=[mx.float32],
     )
     return out
+
+
+# Prefill (L > 16 rows, batch 1) depthwise causal conv of ``model._static_conv``
+# in one pass: per element the FP32 tap products summed in tap order, the
+# weight-dtype rounding, the residual add and scale, the cast; rows >= L - (K-1)
+# also write the next conv state (the FP32 input). No contraction, so every
+# step rounds like the stock elementwise kernels.
+_STATIC_CONV_SOURCE = """
+#pragma METAL fp contract(off)
+    uint c = thread_position_in_grid.x;
+    uint i = thread_position_in_grid.y;
+    if (c >= C) return;
+    const int L = dims[0];
+    const size_t xr = x_strides[1], xc = x_strides[2];
+    float rr[K];
+    for (int j = 0; j < K; ++j) {
+        int p = int(i) + j;
+        rr[j] = p < K - 1 ? state[(size_t)p * C + c]
+                          : static_cast<float>(x[(size_t)(p - (K - 1)) * xr + c * xc]);
+    }
+    float o = taps[c] * rr[0];
+    for (int j = 1; j < K; ++j) {
+        float t = taps[(size_t)j * C + c] * rr[j];
+        o = o + t;
+    }
+    float xf = rr[K - 1];
+    float y = (static_cast<float>(static_cast<W>(o)) + xf) * scale[0];
+    out[(size_t)i * C + c] = static_cast<T>(y);
+    if (int(i) >= L - (K - 1)) {
+        next_state[(size_t)(int(i) - (L - (K - 1))) * C + c] = xf;
+    }
+"""
+_static_conv_kernel = None
+
+
+def static_conv_prefill(x, taps, state, scale, wdtype):
+    """``x`` [1, L, C] (any strides, L >= K), ``taps`` [K, C] FP32 (tap j at
+    row j), ``state`` [1, K-1, C] FP32. Returns (out [1, L, C] x.dtype,
+    next state [1, K-1, C] FP32)."""
+    global _static_conv_kernel
+    if _static_conv_kernel is None:
+        _static_conv_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_static_conv_prefill",
+            input_names=["x", "taps", "state", "scale", "dims"],
+            output_names=["out", "next_state"],
+            source=_STATIC_CONV_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    _, length, c = x.shape
+    k = taps.shape[0]
+    out, nxt = _static_conv_kernel(
+        inputs=[x, taps, mx.contiguous(state), mx.array([scale], dtype=mx.float32),
+                mx.array([length], dtype=mx.int32)],
+        template=[("T", x.dtype), ("W", wdtype), ("C", c), ("K", k)],
+        grid=(c, length, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, length, c), (1, k - 1, c)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+    return out, nxt
+
+
+# Prefill routed-expert combine straight from the expert-sorted outputs:
+# ``out[r] = sum_j zs[inv[r*TOP+j]] * (w[r, j] * (gs[e[r, j]] * inv_den))``,
+# the ops' rounding order (FP32 product, then sum over j in order), no
+# contraction. Replaces the unsort gather, the scale gather and multiplies,
+# the FP32 widening, the product, the sum and the cast.
+_MOE_COMBINE_SORTED_SOURCE = """
+#pragma METAL fp contract(off)
+    uint n = thread_position_in_grid.x;
+    uint r = thread_position_in_grid.y;
+    if (n >= N) return;
+    float total = 0.0f;
+    for (int j = 0; j < TOP; ++j) {
+        float wj = w[r * TOP + j];
+        if (HAS_GS) {
+            float s = gs[inds[r * TOP + j]] * inv_den[0];
+            wj = wj * s;
+        }
+        uint src = inv[r * TOP + j];
+        float p = static_cast<float>(zs[(size_t)src * N + n]) * wj;
+        total = total + p;
+    }
+    out[(size_t)r * N + n] = static_cast<T>(total);
+"""
+_moe_combine_sorted_kernel = None
+
+
+def moe_combine_sorted(zs, inv, weights, inds, global_scale, inv_den, out_dtype):
+    """``zs`` [rows*top, N] expert-sorted outputs (row-contiguous), ``inv``
+    [rows*top] the inverse permutation, ``weights``/``inds`` [rows, top]."""
+    global _moe_combine_sorted_kernel
+    if _moe_combine_sorted_kernel is None:
+        _moe_combine_sorted_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_moe_combine_sorted",
+            input_names=["zs", "inv", "w", "inds", "gs", "inv_den"],
+            output_names=["out"],
+            source=_MOE_COMBINE_SORTED_SOURCE,
+        )
+    rows, top = inds.shape
+    n = zs.shape[-1]
+    has_gs = global_scale is not None
+    gs = global_scale if has_gs else mx.zeros((1,), mx.float32)
+    (out,) = _moe_combine_sorted_kernel(
+        inputs=[zs.reshape(rows * top, n), inv.astype(mx.uint32), weights, inds, gs,
+                mx.array([inv_den], dtype=mx.float32)],
+        template=[("T", out_dtype), ("TOP", top), ("N", n), ("HAS_GS", int(has_gs))],
+        grid=(n, rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, n)],
+        output_dtypes=[out_dtype],
+    )
+    return out
