@@ -143,8 +143,17 @@ def _softcap(x: mx.array, cap: float) -> mx.array:
     return mx.tanh(x / cap) * cap
 
 
-@mx.compile
 def _l2_clip(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
+    # Decode/verify rows: one fused kernel, bit-identical to the ops below.
+    if x.ndim == 4 and x.shape[0] * x.shape[1] <= _COMPILED_MAX_TOKENS and (
+        x.shape[-1] <= 64 or x.shape[-1] % 128 == 0
+    ):
+        return kernels.fused_l2_clip(x, scale, threshold)
+    return _l2_clip_ops(x, scale, threshold)
+
+
+@mx.compile
+def _l2_clip_ops(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
     xf = x.astype(mx.float32) * scale
     norm = mx.sqrt(mx.sum(xf * xf, axis=-1, keepdims=True))
     return (xf * mx.minimum(threshold / (norm + 1e-6), 1.0)).astype(x.dtype)

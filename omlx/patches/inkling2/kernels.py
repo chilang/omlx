@@ -869,3 +869,82 @@ def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int
         output_dtypes=[x.dtype],
     )
     return y
+
+
+# Fused L2 clip for decode/verify rows: ``xf = x * scale`` (FP32),
+# ``out = xf * min(thr / (||xf|| + 1e-6), 1)`` cast to ``x.dtype``, in one
+# kernel instead of multiply + square + row sum + elementwise tail. The row
+# sum follows MLX's own row reduction for a contiguous last-axis sum, so the
+# result is bit-identical: rows of R <= 64 use ``row_reduce_small`` (one
+# thread, sequential); longer rows use ``row_reduce_simple`` (32 lanes, four
+# consecutive elements each, summed in order, then ``simd_sum``).
+_L2_CLIP_SOURCE = """
+    uint row = threadgroup_position_in_grid.x;
+    uint lane = thread_index_in_simdgroup;
+    const float t = thr[0];
+    size_t base = elem_to_loc((size_t)row * R, x_shape, x_strides, x_ndim);
+    uint srow = SH ? (row % (SH ? SH : 1)) * R : 0;
+    if (R <= 64) {
+        if (lane == 0) {
+            float total = 0.0f;
+            for (int i = 0; i < R; ++i) {
+                float xf = static_cast<float>(x[base + i]) * static_cast<float>(scale[SH ? srow + i : 0]);
+                float sq = xf * xf;
+                total = sq + total;
+            }
+            float m = metal::min(t / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+            for (int i = 0; i < R; ++i) {
+                float xf = static_cast<float>(x[base + i]) * static_cast<float>(scale[SH ? srow + i : 0]);
+                out[(size_t)row * R + i] = static_cast<T>(xf * m);
+            }
+        }
+    } else {
+        float xf[R / 32 > 0 ? R / 32 : 1];
+        float total = 0.0f;
+        for (int b = 0; b < R / 128; ++b) {
+            for (int j = 0; j < 4; ++j) {
+                int i = b * 128 + lane * 4 + j;
+                float v = static_cast<float>(x[base + i]) * static_cast<float>(scale[SH ? srow + i : 0]);
+                xf[b * 4 + j] = v;
+                float sq = v * v;
+                total = sq + total;
+            }
+        }
+        total = simd_sum(total);
+        float m = metal::min(t / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+        for (int b = 0; b < R / 128; ++b) {
+            for (int j = 0; j < 4; ++j) {
+                int i = b * 128 + lane * 4 + j;
+                out[(size_t)row * R + i] = static_cast<T>(xf[b * 4 + j] * m);
+            }
+        }
+    }
+"""
+_l2_clip_kernel = None
+
+
+def fused_l2_clip(x, scale, threshold):
+    """``_l2_clip`` in one kernel. ``x`` [..., R] (last axis contiguous),
+    ``scale`` [SH, R] broadcast over the leading rows or a scalar, ``threshold``
+    a scalar FP32 array. R must be <= 64 or a multiple of 128."""
+    global _l2_clip_kernel
+    if _l2_clip_kernel is None:
+        _l2_clip_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_l2_clip",
+            input_names=["x", "scale", "thr"],
+            output_names=["out"],
+            source=_L2_CLIP_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    r = x.shape[-1]
+    rows = x.size // r
+    sh = 0 if scale.ndim == 0 else scale.size // r
+    (out,) = _l2_clip_kernel(
+        inputs=[x, scale.reshape(-1), threshold.reshape(1)],
+        template=[("T", x.dtype), ("R", r), ("SH", sh)],
+        grid=(32 * rows, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[x.dtype],
+    )
+    return out
