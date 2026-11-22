@@ -997,6 +997,29 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     return raw, dtype_str, shape
 
 
+# A block's tensors are materialized with one batched eval (and their uint16
+# views with a second) instead of two evals per tensor: same ops, same bytes,
+# but ~2 x (2 x layers) fewer worker-thread GPU submissions per block, which
+# otherwise interleave with the next request's prefill. "0" restores per-tensor.
+_BATCHED_TENSOR_EVAL = os.environ.get("OMLX_SSD_BATCHED_EVAL", "1") != "0"
+
+
+def _extract_tensors_bytes(arrays: dict) -> dict:
+    """``{name: _extract_tensor_bytes(arr)}`` for a block, evaluated in batches."""
+    if not _BATCHED_TENSOR_EVAL:
+        return {name: _extract_tensor_bytes(arr) for name, arr in arrays.items()}
+    items = list(arrays.items())
+    mx.eval([arr for _, arr in items])
+    views = {name: arr.view(mx.uint16) for name, arr in items if arr.dtype == mx.bfloat16}
+    if views:
+        mx.eval(list(views.values()))
+    out = {}
+    for name, arr in items:
+        raw = bytes(memoryview(views[name])) if name in views else bytes(memoryview(arr))
+        out[name] = (raw, _MX_TO_ST_DTYPE[arr.dtype], list(arr.shape))
+    return out
+
+
 def _restore_tensor_from_bytes(
     raw: bytes, dtype_str: str, shape: list[int]
 ) -> mx.array:
@@ -3846,9 +3869,7 @@ class PagedSSDCacheManager(CacheManager):
             # derived arrays before memoryview() so the buffer protocol never
             # becomes the first MLX eval site on the store-cache worker thread.
             # Race history: #978/#1040/#1106/#1437/#1558.
-            tensors_raw = {}
-            for name, arr in arrays.items():
-                tensors_raw[name] = _extract_tensor_bytes(arr)
+            tensors_raw = _extract_tensors_bytes(arrays)
 
             # Estimate file size: raw tensor bytes + safetensors header.
             # The header is JSON-encoded per tensor (name + dtype + shape +
