@@ -777,6 +777,54 @@ _NVFP4_ROWS_SOURCE = """
     const device uint8_t* ws =
         (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
     const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    if (SINGLE && cnt == 1) {
+        // One pair for this expert: the general body's per-pair arithmetic
+        // without the MAXR-wide bookkeeping.
+        uint pair = order[p];
+        const device T* x1 = x + (size_t)(pair / SRC_DIV) * K + lane * 8;
+        float res1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < K; k += 256) {
+            if (k + (int)lane * 8 < K) {
+                float s[4];
+                float wd[4][8];
+                for (int r = 0; r < 4; ++r) {
+                    const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                    for (int i = 0; i < 2; ++i) {
+                        ushort q = w16[i];
+                        wd[r][4 * i] = fp4v(q);
+                        wd[r][4 * i + 1] = fp4v(q >> 4);
+                        wd[r][4 * i + 2] = fp4v(q >> 8);
+                        wd[r][4 * i + 3] = fp4v(q >> 12);
+                    }
+                    uchar sb = sc[r * KG];
+                    ushort v = sb & 127;
+                    ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                    s[r] = float(as_type<half>(u) * 256.0h);
+                }
+                float xt[8];
+                for (int i = 0; i < 8; ++i) {
+                    xt[i] = float(x1[k + i]);
+                }
+                for (int r = 0; r < 4; ++r) {
+                    float accum = 0.0f;
+                    for (int i = 0; i < 2; ++i) {
+                        accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                                  xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
+                    }
+                    res1[r] += s[r] * accum;
+                }
+            }
+            ws += 128;
+            sc += 16;
+        }
+        for (int r = 0; r < 4; ++r) {
+            float v = simd_sum(res1[r]);
+            if (lane == 0) {
+                y[(size_t)pair * N + out_row + r] = static_cast<T>(v);
+            }
+        }
+        return;
+    }
     uint dst[MAXR];
     const device T* xs[MAXR];
     for (int j = 0; j < MAXR; ++j) {
@@ -853,6 +901,8 @@ _nvfp4_rows_exact_kernel = None
 import os as _os
 
 _EXACT_VERIFY_EXPERTS = _os.environ.get("OMLX_INKLING2_EXACT_VERIFY", "") == "1"
+# Verify widths: singleton experts take a one-pair branch (OMLX_INKLING2_MK_SINGLE=1).
+MK_SINGLE = int(_os.environ.get("OMLX_INKLING2_MK_SINGLE", "0") == "1")
 
 
 # Loop-controller projections for decode/verify-sized rows: FP32 inputs times
@@ -980,6 +1030,7 @@ def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int
             ("P", pairs),
             ("MAXR", max_rows),
             ("SRC_DIV", src_div),
+            ("SINGLE", MK_SINGLE if max_rows > 1 else 0),
         ],
         grid=(64 * (n // 8), pairs, 1),
         threadgroup=(64, 1, 1),
@@ -2537,3 +2588,57 @@ def mk_oproj_rows(xg, w, scales, biases, group_size, state, taps, cscale, wdtype
         output_dtypes=[mx.float32, mx.float32],
     )
     return residual, win
+
+
+# Megakernel slice 17 (OMLX_INKLING2_MK_ROUTE_ROWS=1): verify-width routing in
+# one launch: simdgroup r runs ``_ROUTER_SOURCE`` for row r (same arithmetic as
+# route_topk), then one lane orders the R*K pairs by expert (stable insertion
+# sort on (expert, pair)), giving the grouped kernels' order / sorted experts
+# (any order with equal experts adjacent gives the same values; this one is
+# argsort's for distinct keys). Replaces route_topk + argsort + astype + gather.
+_ROUTER_ROWS_SOURCE = _ROUTER_SOURCE.replace(
+    "    uint row = threadgroup_position_in_grid.x;\n    uint lane = thread_index_in_simdgroup;",
+    "    uint row = simdgroup_index_in_threadgroup;\n    uint lane = thread_index_in_simdgroup;\n"
+    "    threadgroup uint all_e[ROWS * K];\n    if (row < ROWS) {",
+).rstrip() + """
+        if (lane == 0) for (uint k = 0; k < K; ++k) all_e[row * K + k] = chosen[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        // Parallel stable rank: pair i goes to the number of pairs before it in (expert, index) order.
+        uint i = row * 32 + lane;
+        if (i < ROWS * K) {
+            uint ei = all_e[i];
+            uint rank = 0;
+            for (uint j = 0; j < ROWS * K; ++j) {
+                uint ej = all_e[j];
+                rank += (ej < ei || (ej == ei && j < i)) ? 1u : 0u;
+            }
+            order[rank] = i;
+            sorted_e[rank] = ei;
+        }
+    }
+"""
+_router_rows_kernel = None
+
+
+def route_topk_sorted_rows(logits, bias, top_k, route_scale):
+    """``route_topk`` for R rows (R <= 32) plus (order, sorted experts) [R*K] u32."""
+    global _router_rows_kernel
+    rows, experts = logits.shape
+    if _router_rows_kernel is None:
+        _router_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_route_topk_sorted_rows",
+            input_names=["logits", "bias", "route_scale"],
+            output_names=["inds", "weights", "order", "sorted_e"],
+            source=_ROUTER_ROWS_SOURCE,
+        )
+    inds, weights, order, sorted_e = _router_rows_kernel(
+        inputs=[logits.astype(mx.float32), bias.astype(mx.float32), mx.array([route_scale], dtype=mx.float32)],
+        template=[("E", experts), ("K", top_k), ("ROWS", rows)],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(rows * 32, 1, 1),
+        output_shapes=[(rows, top_k), (rows, top_k), (rows * top_k,), (rows * top_k,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32],
+    )
+    return inds, weights, order, sorted_e
