@@ -848,6 +848,11 @@ inline float fp4v(ushort b) {
 """
 _nvfp4_rows_kernel = None
 _nvfp4_rows_exact_kernel = None
+# OMLX_INKLING2_EXACT_VERIFY=1: verify rows (2-8) also take the unfused kernel,
+# so they equal stock gather_qmm bit for bit (costs ~0.6 ms per 4-row verify).
+import os as _os
+
+_EXACT_VERIFY_EXPERTS = _os.environ.get("OMLX_INKLING2_EXACT_VERIFY", "") == "1"
 
 
 # Loop-controller projections for decode/verify-sized rows: FP32 inputs times
@@ -961,7 +966,8 @@ def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int
             header=_NVFP4_ROWS_HEADER,
             source="#pragma METAL fp contract(off)\n" + _NVFP4_ROWS_SOURCE,
         )
-    kernel = _nvfp4_rows_exact_kernel if max_rows == 1 else _nvfp4_rows_kernel
+    exact = max_rows == 1 or _EXACT_VERIFY_EXPERTS
+    kernel = _nvfp4_rows_exact_kernel if exact else _nvfp4_rows_kernel
     pairs = order.shape[0]
     n = w.shape[1]
     k = x.shape[-1]
