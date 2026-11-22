@@ -732,10 +732,6 @@ def route_topk(logits: mx.array, bias: mx.array, top_k: int, route_scale: float)
 # group scale applied per lane block, then ``simd_sum``), so each output
 # should equal the ``gather_qmm`` output bit for bit; the tests check that.
 _NVFP4_ROWS_SOURCE = """
-    // MLX's precompiled qmv does not fuse these multiply-adds; a JIT kernel
-    // would, and the one-ulp differences then flip a bf16 output now and
-    // then (the cause of the r1 server-guard failure, loop attempt 6).
-#pragma METAL fp contract(off)
     uint p = threadgroup_position_in_grid.y;
     uint e = sorted_e[p];
     if (p > 0 && sorted_e[p - 1] == e) {
