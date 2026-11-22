@@ -515,38 +515,6 @@ def _dynamic_conv(x, dyn, static_w, state, heads, scale):
     return out.astype(x.dtype), xp
 
 
-_VK_PROJ = True
-
-
-def _qproj(lin, x):
-    """``lin(x)``; 3-6 row verify calls of wide 8-bit projections take the
-    split-K verify kernel (``vk_qmm``), which reads each weight once for all
-    rows. (Verify numerics only: decode and prefill keep the stock qmm.)"""
-    if _VK_PROJ and x.ndim == 3 and isinstance(lin, nn.QuantizedLinear):
-        rows = x.shape[0] * x.shape[1]
-        n = lin.scales.shape[0]
-        if (
-            3 <= rows <= 6
-            and lin.bits == 8
-            and getattr(lin, "mode", "affine") == "affine"
-            and n >= 2048
-            and "bias" not in lin
-            and lin.scales.dtype == x.dtype
-        ):
-            from ..qwen35_verify_qmm import vk_qmm
-
-            y = vk_qmm(
-                x.reshape(rows, x.shape[-1]),
-                lin.weight,
-                lin.scales,
-                lin.biases,
-                bits=8,
-                group_size=lin.group_size,
-            )
-            return y.reshape(*x.shape[:-1], n)
-    return lin(x)
-
-
 def _row_slice_qlinear(lin, start, stop):
     """An ``nn.QuantizedLinear`` over output rows [start, stop) of ``lin``
     (same packed words, scales and biases, so each output is bit-identical)."""
@@ -655,7 +623,7 @@ class Inkling2Attention(nn.Module):
         dkv = self.dkv
         if self.sliding:
             if xk is None:
-                q, k, v, r, gate, sink = mx.split(_qproj(self.in_proj, xq), self._cuts, axis=-1)
+                q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
             else:
                 kv_lin = self.__dict__.get("_kv_lin")
                 if kv_lin is None or not 2 <= length <= 4:
@@ -670,7 +638,7 @@ class Inkling2Attention(nn.Module):
                     v = pv[..., self._cuts[1] : self._cuts[2]]
                 else:
                     # k and v through only their own rows of in_proj.
-                    pq = _qproj(self.in_proj, xq)
+                    pq = self.in_proj(xq)
                     k, v = kv_lin[0](xk), kv_lin[1](xv)
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
             k, ks = _static_conv(
@@ -680,7 +648,7 @@ class Inkling2Attention(nn.Module):
                 v, self._v_taps, vs, self._sconv_scale, self.v_conv.dtype
             )
         else:
-            q, r, gate, sink = mx.split(_qproj(self.q_proj, xq), self._cuts, axis=-1)
+            q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
             kp = self.k_proj(xk)
             vp = self.v_proj(xv)
             k, ks = _dynamic_conv(
@@ -748,7 +716,7 @@ class Inkling2Attention(nn.Module):
         out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
             gate.dtype
         )
-        return _qproj(self.o_proj, out)
+        return self.o_proj(out)
 
 
 def _cumsum(xs):
