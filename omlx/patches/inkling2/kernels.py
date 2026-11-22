@@ -1023,11 +1023,13 @@ _MIX_Z_SOURCE = """
     size_t flat = ((size_t)i * ROWS + r) * D;
     float xv[NR];
     float acc = 0;
+    size_t xb = elem_to_loc(flat, x_shape, x_strides, x_ndim);
+    size_t mb = elem_to_loc(flat, m_shape, m_strides, m_ndim);
+    int64_t xs = x_strides[x_ndim - 1], ms = m_strides[m_ndim - 1];
     for (int k = 0; k < NR; k++) {
         int c = lid * NR + k;
         if (c < D) {
-            xv[k] = half_ == 0 ? x[elem_to_loc(flat + c, x_shape, x_strides, x_ndim)]
-                               : m[elem_to_loc(flat + c, m_shape, m_strides, m_ndim)];
+            xv[k] = half_ == 0 ? x[xb + c * xs] : m[mb + c * ms];
             acc += xv[k] * xv[k];
         }
     }
@@ -1093,50 +1095,58 @@ _LOOP_MIX_UP_SOURCE = """
     const device bfloat16_t* wp = w + (size_t)bi * K * N2 + col;
     const device float* pa = parts + (size_t)(2 * bi) * ROWS * K;
     const device float* pb = parts + (size_t)(2 * bi + 1) * ROWS * K;
+    // low = bf16(sum of the two halves), as the stock axis-1 sum + casts.
+    threadgroup float low[ROWS * K];
+    for (uint e = t; e < ROWS * K; e += 8 * CPT) {
+        float s = 0.0f;
+        s = pa[e] + s;
+        s = pb[e] + s;
+        low[e] = static_cast<float>(static_cast<bfloat16_t>(s));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float ag[ROWS];
     float af[ROWS];
     for (int r = 0; r < ROWS; ++r) { ag[r] = 0.0f; af[r] = 0.0f; }
     for (int i0 = 0; i0 < K / 32; ++i0) {
+        float wg[4], wf[4];
         for (int tm = 0; tm < 4; ++tm) {
             int k = i0 * 32 + j * 4 + tm;
-            float wg = static_cast<float>(wp[(size_t)k * N2]);
-            float wf = static_cast<float>(wp[(size_t)k * N2 + H]);
+            wg[tm] = static_cast<float>(wp[(size_t)k * N2]);
+            wf[tm] = static_cast<float>(wp[(size_t)k * N2 + H]);
+        }
+        for (int tm = 0; tm < 4; ++tm) {
+            int k = i0 * 32 + j * 4 + tm;
             for (int r = 0; r < ROWS; ++r) {
-                float s = 0.0f;
-                s = pa[r * K + k] + s;
-                s = pb[r * K + k] + s;
-                float vc = static_cast<float>(static_cast<bfloat16_t>(s));
-                ag[r] += vc * wg;
-                af[r] += vc * wf;
+                float vc = low[r * K + k];
+                ag[r] += vc * wg[tm];
+                af[r] += vc * wf[tm];
             }
         }
     }
     threadgroup float red[2][8][ROWS][CPT];
     for (int r = 0; r < ROWS; ++r) { red[0][j][r][lane] = ag[r]; red[1][j][r][lane] = af[r]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (j == 0) {
-        for (int r = 0; r < ROWS; ++r) {
-            float g2[2];
-            for (int u = 0; u < 2; ++u) {
-                float p0 = red[u][0][r][lane], p1 = red[u][1][r][lane], p2 = red[u][2][r][lane], p3 = red[u][3][r][lane];
-                float p4 = red[u][4][r][lane], p5 = red[u][5][r][lane], p6 = red[u][6][r][lane], p7 = red[u][7][r][lane];
-                float a0 = p0 + p4, a1 = p1 + p5, a2 = p2 + p6, a3 = p3 + p7;
-                float b0 = a0 + a2, b1 = a1 + a3;
-                g2[u] = b0 + b1;
-            }
-            float gain = metal::precise::tanh(g2[0]);
-            float forget = metal::precise::tanh(g2[1]);
-            size_t flat = ((size_t)bi * ROWS + r) * H + col;
-            float xv = x[elem_to_loc(flat, x_shape, x_strides, x_ndim)];
-            float mv = m[elem_to_loc(flat, m_shape, m_strides, m_ndim)];
-            // Two products and a separate add, as the stock elementwise ops
-            // round them (no fused multiply-add).
-            {
+    for (int r = j; r < ROWS; r += 8) {
+        float g2[2];
+        for (int u = 0; u < 2; ++u) {
+            float p0 = red[u][0][r][lane], p1 = red[u][1][r][lane], p2 = red[u][2][r][lane], p3 = red[u][3][r][lane];
+            float p4 = red[u][4][r][lane], p5 = red[u][5][r][lane], p6 = red[u][6][r][lane], p7 = red[u][7][r][lane];
+            float a0 = p0 + p4, a1 = p1 + p5, a2 = p2 + p6, a3 = p3 + p7;
+            float b0 = a0 + a2, b1 = a1 + a3;
+            g2[u] = b0 + b1;
+        }
+        float gain = metal::precise::tanh(g2[0]);
+        float forget = metal::precise::tanh(g2[1]);
+        size_t flat = ((size_t)bi * ROWS + r) * H;
+        float xv = x[elem_to_loc(flat, x_shape, x_strides, x_ndim) + col * x_strides[x_ndim - 1]];
+        float mv = m[elem_to_loc(flat, m_shape, m_strides, m_ndim) + col * m_strides[m_ndim - 1]];
+        // Two products and a separate add, as the stock elementwise ops
+        // round them (no fused multiply-add).
+        {
 #pragma METAL fp contract(off)
-                float keep = (1.0f - forget) * xv;
-                float add = gain * mv;
-                out[flat] = keep + add;
-            }
+            float keep = (1.0f - forget) * xv;
+            float add = gain * mv;
+            out[flat + col] = keep + add;
         }
     }
 """
@@ -1159,9 +1169,7 @@ def loop_mix_up(parts, w, x, message):
     n, b, length, h = x.shape
     rows = b * length
     k = parts.shape[-1]
-    # Narrow threadgroups: this latency-bound kernel needs many of them
-    # (each thread already computes both the gain and the forget column).
-    cpt = 8
+    cpt = 32 if rows == 1 else 16  # fastest per width in a dependent-chain microbench
     (out,) = _loop_mix_up_kernel(
         inputs=[parts, w, x, message],
         template=[("K", k), ("H", h), ("N2", 2 * h), ("ROWS", rows), ("CPT", cpt)],
