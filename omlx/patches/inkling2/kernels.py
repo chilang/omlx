@@ -2238,3 +2238,135 @@ def mk_norm_rows(y, norm_w):
         output_dtypes=[mx.bfloat16],
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Megakernel slice 11 (OMLX_INKLING2_MK_PREP_ROWS=1): the sliding-visit prep at
+# verify widths (2..16 rows): per (row, head) tasks; static conv over the
+# window [state, x] (written out whole for the verify rollback), clips, v
+# unit RMS, rel bias in its standard [L, H, R] layout. q/k/v sources may be
+# different arrays (looped visits); each has its own row stride and offset.
+# ---------------------------------------------------------------------------
+_MK_PREP_ROWS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint task = threadgroup_position_in_grid.y;
+    uint lane = thread_index_in_simdgroup;
+    const float tq = thr[0];
+    const float tr = thr[1];
+    constexpr uint NQ = L * HQ, NK = L * HKV;
+    if (task < NQ) {
+        uint l = task / HQ, h = task % HQ;
+        float v[4];
+        float total = 0.0f;
+        for (int j = 0; j < 4; ++j) {
+            uint i = h * D + lane * 4 + j;
+            v[j] = static_cast<float>(qs[Q0 + l * QST + i]) * static_cast<float>(qscale[i]);
+            float sq = v[j] * v[j]; total = sq + total;
+        }
+        total = simd_sum(total);
+        float m = metal::min(tq / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+        for (int j = 0; j < 4; ++j) qout[(l * HQ + h) * D + lane * 4 + j] = static_cast<T>(v[j] * m);
+        return;
+    }
+    if (task < NQ + 2 * NK) {
+        bool isk = task < NQ + NK;
+        uint t2 = isk ? task - NQ : task - NQ - NK;
+        uint l = t2 / HKV, h = t2 % HKV;
+        const device T* src = isk ? ks_ : vs_;
+        const uint off = isk ? K0 : V0;
+        const uint rst = isk ? KST : VST;
+        const device float* st = isk ? kst : vst;
+        const device float* tp = isk ? ktaps : vtaps;
+        device float* win = isk ? kwin : vwin;
+        float cv[4];
+        for (int j = 0; j < 4; ++j) {
+            uint c = h * D + lane * 4 + j;
+            float rr[KT];
+            for (int t = 0; t < KT; ++t) {
+                int p = int(l) + t;   // window row
+                rr[t] = p < KT - 1 ? st[(size_t)p * C + c]
+                                   : static_cast<float>(src[off + (size_t)(p - (KT - 1)) * rst + c]);
+            }
+            float o = tp[c] * rr[0];
+            for (int t = 1; t < KT; ++t) {
+                if (CFMA) o = metal::fma(tp[(size_t)t * C + c], rr[t], o);
+                else { float tt = tp[(size_t)t * C + c] * rr[t]; o = o + tt; }
+            }
+            float y = (static_cast<float>(static_cast<W>(o)) + rr[KT - 1]) * cscale[0];
+            cv[j] = static_cast<float>(static_cast<T>(y));
+            win[(size_t)(KT - 1 + l) * C + c] = rr[KT - 1];
+            if (l == 0) for (int t = 0; t < KT - 1; ++t) win[(size_t)t * C + c] = rr[t];
+        }
+        if (isk) {
+            float total = 0.0f;
+            for (int j = 0; j < 4; ++j) { float sq = cv[j] * cv[j]; total = sq + total; }
+            total = simd_sum(total);
+            float m = metal::min(tq / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+            for (int j = 0; j < 4; ++j) kout[(l * HKV + h) * D + lane * 4 + j] = static_cast<T>(cv[j] * m);
+        } else {
+            float racc = 0.0f;
+            for (int j = 0; j < 4; ++j) { float sq = cv[j] * cv[j]; racc = racc + sq; }
+            racc = simd_sum(racc);
+            float tot = simd_sum(lane == 0 ? racc : 0.0f);
+            float inv = metal::precise::rsqrt(tot / D + 1e-6f);
+            for (int j = 0; j < 4; ++j) vout[(l * HKV + h) * D + lane * 4 + j] = static_cast<T>(cv[j] * inv);
+        }
+        return;
+    }
+    uint idx = task - NQ - 2 * NK;
+    uint l = idx / (HQ * RCH);
+    uint rem = idx % (HQ * RCH);
+    uint h = rem / RCH, chunk = rem % RCH;
+    float rv = 0.0f;
+    if (lane < DR) rv = static_cast<float>(qs[R0 + l * QST + h * DR + lane]) * static_cast<float>(rscale[h * DR + lane]);
+    float sq = rv * rv;
+    float total = 0.0f;
+    for (int i = 0; i < DR; ++i) { float si = simd_shuffle(sq, (ushort)i); total = si + total; }
+    float m = metal::min(tr / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+    float rc = static_cast<float>(static_cast<T>(rv * m));
+    for (int it = 0; it < 8; ++it) {
+        uint d = chunk * 256 + it * 32 + lane;
+        float acc = 0.0f;
+        for (int k = 0; k < DR; ++k) {
+            float rk = simd_shuffle(rc, (ushort)k);
+            acc = metal::fma(rk, static_cast<float>(relp[(size_t)k * NREL + d]), acc);
+        }
+        if (d < NREL) rel[((size_t)l * HQ + h) * NREL + d] = static_cast<T>(acc);
+    }
+"""
+_mk_prep_rows_kernel = None
+MK_PREP_ROWS_CFMA = 0
+
+
+def mk_prep_rows(qs, q0, qst, r0, ks_, k0, kst_r, vs_, v0, vst_r, length, qscale, rscale, thr,
+                 ktaps, vtaps, kst, vst, cscale, wdtype, relp, hq, hkv, d, dr):
+    """Sliding prep for ``length`` rows. Sources are flat bf16 arrays with
+    (offset, row stride). Returns q [1, L, HQ, D], k/v [1, L, HKV, D], rel
+    [1, L, HQ, NREL] bf16 and the k/v windows [1, KT-1+L, C] FP32."""
+    global _mk_prep_rows_kernel
+    if _mk_prep_rows_kernel is None:
+        _mk_prep_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_prep_rows",
+            input_names=["qs", "ks_", "vs_", "qscale", "rscale", "thr", "ktaps", "vtaps", "kst", "vst", "cscale", "relp"],
+            output_names=["qout", "kout", "vout", "rel", "kwin", "vwin"],
+            source=_MK_PREP_ROWS_SOURCE,
+        )
+    nrel = relp.shape[1]
+    rch = (nrel + 255) // 256
+    c = hkv * d
+    kt = ktaps.shape[0]
+    outs = _mk_prep_rows_kernel(
+        inputs=[qs.reshape(-1), ks_.reshape(-1), vs_.reshape(-1), qscale.reshape(-1).astype(mx.float32),
+                rscale.reshape(-1).astype(mx.float32), thr, ktaps, vtaps, mx.contiguous(kst), mx.contiguous(vst),
+                mx.array([cscale], dtype=mx.float32), relp],
+        template=[("T", qs.dtype), ("W", wdtype), ("L", length), ("HQ", hq), ("HKV", hkv), ("D", d), ("DR", dr),
+                  ("C", c), ("KT", kt), ("NREL", nrel), ("RCH", rch),
+                  ("Q0", q0), ("QST", qst), ("R0", r0), ("K0", k0), ("KST", kst_r), ("V0", v0), ("VST", vst_r),
+                  ("CFMA", MK_PREP_ROWS_CFMA)],
+        grid=(32, length * (hq + 2 * hkv + hq * rch), 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(1, length, hq, d), (1, length, hkv, d), (1, length, hkv, d), (1, length, hq, nrel),
+                       (1, kt - 1 + length, c), (1, kt - 1 + length, c)],
+        output_dtypes=[qs.dtype] * 4 + [mx.float32, mx.float32],
+    )
+    return tuple(outs)

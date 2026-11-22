@@ -525,6 +525,8 @@ _MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
 # Megakernel slice 6: sliding single-token projection epilogue in one kernel.
 _MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "") == "1"
 _MK_PREP_FULL = os.environ.get("OMLX_INKLING2_MK_PREP_FULL", "1") != "0"
+# Megakernel slice 11: sliding prep at verify widths (2..16 rows).
+_MK_PREP_ROWS = os.environ.get("OMLX_INKLING2_MK_PREP_ROWS", "") == "1"
 # Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
 _MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
@@ -733,6 +735,12 @@ class Inkling2Attention(nn.Module):
         ):
             return self._mk_project(xq, xk, xv, ks, vs)
         if (
+            _MK_PREP_ROWS and self.sliding and b == 1 and 2 <= length <= _COMPILED_MAX_TOKENS
+            and tau is None and xq.dtype == mx.bfloat16 and ks.dtype == mx.float32
+            and vs.dtype == mx.float32 and self.head_dim == 128 and self.d_rel <= 32
+        ):
+            return self._mk_project_rows(xq, xk, xv, ks, vs)
+        if (
             _MK_PREP and _MK_PREP_FULL and not self.sliding and b == 1 and length == 1 and tau is not None
             and xq.dtype == mx.bfloat16 and ks.dtype == mx.float32 and vs.dtype == mx.float32
             and self.head_dim == 128 and self.d_rel <= 32
@@ -839,6 +847,44 @@ class Inkling2Attention(nn.Module):
         gate = qrow[..., c[3] : c[4]]
         sink = qrow[..., c[4] :]
         return q, k, v, relrev, gate, sink, ks, vs
+
+    def _mk_project_rows(self, xq, xk, xv, ks, vs):
+        """Verify-width sliding projections (same projection calls as
+        ``project``) + ``kernels.mk_prep_rows``."""
+        c = self._cuts
+        length = xq.shape[1]
+        if xk is None:
+            src = _proj(self.in_proj, xq)
+            w = src.shape[-1]
+            qs = ks_ = vs_ = src
+            offs = (0, w, c[2], c[0], w, c[1], w)
+            qrow = src
+        else:
+            kv_lin = self.__dict__.get("_kv_lin")
+            if kv_lin is None or not (2 <= length <= 4 or length > 256):
+                st = self.in_proj(mx.concatenate([xq, xk, xv], axis=0))
+                w = st.shape[-1]
+                qs = ks_ = vs_ = st
+                offs = (0, w, c[2], length * w + c[0], w, 2 * length * w + c[1], w)
+                qrow = st[0:1]
+            else:
+                qs = _proj(self.in_proj, xq)
+                ks_, vs_ = _proj(kv_lin[0], xk), _proj(kv_lin[1], xv)
+                w = qs.shape[-1]
+                offs = (0, w, c[2], 0, ks_.shape[-1], 0, vs_.shape[-1])
+                qrow = qs
+        q, k, v, rel, kw, vw = kernels.mk_prep_rows(
+            qs, offs[0], offs[1], offs[2], ks_, offs[3], offs[4], vs_, offs[5], offs[6], length,
+            self.q_scale, self.r_scale,
+            mx.concatenate([self._qk_clip.reshape(1), self._r_clip.reshape(1)]),
+            _stacked(self._k_taps), _stacked(self._v_taps), ks, vs, self._sconv_scale,
+            self.k_conv.dtype, self.rel_proj.astype(qs.dtype),
+            self.n_heads, self.n_kv, self.head_dim, self.d_rel,
+        )
+        gate = qrow[..., c[3] : c[4]]
+        sink = qrow[..., c[4] :]
+        return (q.transpose(0, 2, 1, 3), k.transpose(0, 2, 1, 3), v.transpose(0, 2, 1, 3),
+                rel, gate, sink, kw, vw)
 
     def _mk_project_full(self, xq, xk, xv, ks, vs, tau):
         c = self._cuts
