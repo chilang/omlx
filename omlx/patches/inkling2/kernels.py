@@ -2642,3 +2642,94 @@ def route_topk_sorted_rows(logits, bias, top_k, route_scale):
         output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32],
     )
     return inds, weights, order, sorted_e
+
+
+# ---------------------------------------------------------------------------
+# Megakernel slice 19 (OMLX_INKLING2_MK_AFFINE=1): affine 4-bit expert layers
+# (the checkpoint's layers 20-23). Per (row, expert) pair the arithmetic is
+# MLX 0.32.4's ``qmv_impl`` for 4-bit affine (8 values per lane per 256 block,
+# x pre-divided by 16/256/4096, masked nibbles, fma(scale, accum, sum * bias),
+# simd_sum; tools/mk_affine4_probe.py: 0 diffs vs gather_qmm at K 2304 / 1152).
+#   aff_rows: verify widths, each distinct expert's tile read once for all its
+#   pairs (as nvfp4_gather_rows); r1: aff ups (+ softcapped SwiGLU) and aff
+#   downs (+ combine without tensor scale + MLP conv + residual).
+# ---------------------------------------------------------------------------
+_AFF4_DOT = """
+        float result[RPS];
+        for (int r = 0; r < RPS; ++r) result[r] = 0.0f;
+        for (int k = 0; k < KD; k += 256) {
+            if (k + (int)lane * 8 < KD) {
+                float xt[8]; float sum = 0.0f;
+                for (int i = 0; i < 8; i += 4) {
+                    float a0 = float(xs[k + i]), a1 = float(xs[k + i + 1]), a2 = float(xs[k + i + 2]), a3 = float(xs[k + i + 3]);
+                    float q = ((a0 + a1) + a2) + a3;
+                    sum = sum + q;
+                    xt[i] = a0; xt[i + 1] = a1 / 16.0f; xt[i + 2] = a2 / 256.0f; xt[i + 3] = a3 / 4096.0f;
+                }
+                for (int r = 0; r < RPS; ++r) {
+                    const device ushort* w16 = (const device ushort*)(wsb + (size_t)r * KB + k / 2);
+                    float accum = 0.0f;
+                    for (int i = 0; i < 2; ++i) {
+                        ushort q = w16[i];
+                        float t = ((xt[4*i] * float(q & 0x000f) + xt[4*i+1] * float(q & 0x00f0)) + xt[4*i+2] * float(q & 0x0f00)) + xt[4*i+3] * float(q & 0xf000);
+                        accum = accum + t;
+                    }
+                    float s = float(slb[(size_t)r * KG + k / GS]), b = float(blb[(size_t)r * KG + k / GS]);
+                    result[r] += metal::fma(s, accum, sum * b);
+                }
+            }
+        }
+        T z[RPS];
+        for (int r = 0; r < RPS; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
+"""
+_AFF4_ROWS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint p = threadgroup_position_in_grid.y;
+    uint e = sorted_e[p];
+    if (p > 0 && sorted_e[p - 1] == e) return;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int cnt = 1;
+    while (cnt < MAXR && p + cnt < P && sorted_e[p + cnt] == e) cnt++;
+    constexpr int RPS = 4;
+    constexpr int KD = K;
+    constexpr int KB = K / 2;
+    constexpr int KG = K / GS;
+    int out_row = threadgroup_position_in_grid.x * 8 + simd_gid * 4;
+    const device uint8_t* wsb = (const device uint8_t*)w + ((size_t)e * N + out_row) * KB + lane * 4;
+    const device T* slb = scales + ((size_t)e * N + out_row) * KG + lane / (GS / 8);
+    const device T* blb = biases + ((size_t)e * N + out_row) * KG + lane / (GS / 8);
+    for (int j = 0; j < cnt; ++j) {
+        uint pair = order[p + j];
+        const device T* xs = x + (size_t)(pair / SRC_DIV) * K + lane * 8;
+""" + _AFF4_DOT + """
+        if (lane == 0)
+            for (int r = 0; r < RPS; ++r) y[(size_t)pair * N + out_row + r] = z[r];
+    }
+"""
+_aff_rows_kernel = None
+
+
+def affine4_gather_rows(x, w, scales, biases, group_size, order, sorted_e, src_div, max_rows):
+    """``gather_qmm`` (affine 4-bit, per-pair M = 1) for expert-sorted pairs,
+    each distinct expert's weights read once. Returns [P, N]."""
+    global _aff_rows_kernel
+    if _aff_rows_kernel is None:
+        _aff_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_aff4_gather_rows",
+            input_names=["x", "w", "scales", "biases", "sorted_e", "order"],
+            output_names=["y"],
+            source=_AFF4_ROWS_SOURCE,
+        )
+    pairs = order.shape[0]
+    n = w.shape[1]
+    k = x.shape[-1]
+    (y,) = _aff_rows_kernel(
+        inputs=[x, w, scales, biases, sorted_e, order],
+        template=[("T", x.dtype), ("K", k), ("N", n), ("GS", group_size), ("P", pairs), ("MAXR", max_rows), ("SRC_DIV", src_div)],
+        grid=(64 * (n // 8), pairs, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x.dtype],
+    )
+    return y

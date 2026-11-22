@@ -339,6 +339,24 @@ class Inkling2Experts(nn.Module):
         out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
         return out.astype(x.dtype)
 
+    def _grouped_affine(self, x, inds, weights):
+        """Affine 4-bit experts at 1..8 rows: each distinct expert read once
+        (``kernels.affine4_gather_rows``, per pair = gather_qmm); the rest is
+        the stock unsorted path (softcapped SwiGLU, moe_combine)."""
+        rows, top = inds.shape
+        flat = inds.reshape(-1)
+        order = mx.argsort(flat).astype(mx.uint32)
+        sorted_e = flat[order]
+        y = kernels.affine4_gather_rows(
+            x, self.w13.weight, self.w13.scales, self.w13.biases, self.w13.group_size, order, sorted_e, top, rows
+        ).reshape(rows, top, 1, -1)
+        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+        z = kernels.affine4_gather_rows(
+            act.reshape(rows * top, -1), self.w2.weight, self.w2.scales, self.w2.biases, self.w2.group_size,
+            order, sorted_e, 1, rows,
+        ).reshape(rows, top, -1)
+        return kernels.moe_combine(z, weights, inds, None, 1.0 / _NVFP4_DENOMINATOR, x.dtype)
+
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         if (
             self.w13.mode == "nvfp4"
@@ -346,6 +364,12 @@ class Inkling2Experts(nn.Module):
             and 1 <= inds.shape[0] <= _GROUPED_MAX_ROWS
         ):
             return self._grouped_nvfp4(x, inds, weights)
+        if (
+            _MK_AFFINE and self.w13.mode == "affine" and self.w2.mode == "affine" and self.w13.bits == 4
+            and self.w2.bits == 4 and 1 <= inds.shape[0] <= _GROUPED_MAX_ROWS and x.dtype == mx.bfloat16
+            and self.w13.scales.dtype == mx.bfloat16 and mx.default_device() == mx.gpu
+        ):
+            return self._grouped_affine(x, inds, weights)
         xe = mx.expand_dims(x, (-2, -3))
         do_sort = inds.size >= 64
         idx = inds
@@ -543,6 +567,8 @@ _MK_MOE_ROWS = os.environ.get("OMLX_INKLING2_MK_MOE_ROWS", "") == "1"
 _MK_OPROJ_ROWS = os.environ.get("OMLX_INKLING2_MK_OPROJ_ROWS", "") == "1"
 # Megakernel slice 17: verify-width routing + pair order in one kernel.
 _MK_ROUTE_ROWS = os.environ.get("OMLX_INKLING2_MK_ROUTE_ROWS", "") == "1"
+# Megakernel slice 19: affine 4-bit expert layers, each distinct expert read once (1..8 rows).
+_MK_AFFINE = os.environ.get("OMLX_INKLING2_MK_AFFINE", "") == "1"
 # Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
 _MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
