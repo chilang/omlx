@@ -314,6 +314,10 @@ class Inkling2Experts(nn.Module):
             1,
             rows,
         ).reshape(rows, top, -1)
+        if rows <= _COMPILED_MAX_TOKENS:
+            return kernels.moe_combine(
+                z, weights, inds, self.w2.global_scale, 1.0 / _NVFP4_DENOMINATOR, x.dtype
+            )
         weights = weights * self.w2.post_scale(inds)
         out = mx.sum(z.astype(mx.float32) * weights[..., None], axis=-2)
         return out.astype(x.dtype)
@@ -340,6 +344,16 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             z = _scatter_unsort(z, inv, inds.shape)
         z = z.squeeze(-2)
+        if inds.shape[0] <= _COMPILED_MAX_TOKENS:
+            # Scale gather, weight products, top-k sum and cast in one kernel.
+            return kernels.moe_combine(
+                z,
+                weights,
+                inds,
+                self.w2.global_scale if self.w2.mode == "nvfp4" else None,
+                1.0 / _NVFP4_DENOMINATOR,
+                x.dtype,
+            )
         s2 = self.w2.post_scale(inds)
         if s2 is not None:
             weights = weights * s2

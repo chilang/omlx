@@ -951,3 +951,52 @@ def fused_l2_clip(x, scale, threshold):
         output_dtypes=[x.dtype],
     )
     return out
+
+
+# Routed-expert combine for decode/verify rows:
+# ``out[r] = sum_j z[r, j] * (w[r, j] * (gs[e[r, j]] * inv_den))`` in FP32,
+# summed over the top-k axis in order (MLX's small column reduction: one
+# thread per output, sequential), then cast to ``T``. Replaces the scale
+# gather, the scale/weight multiplies, the product, the sum and the cast.
+_MOE_COMBINE_SOURCE = """
+    uint n = thread_position_in_grid.x;
+    uint r = thread_position_in_grid.y;
+    if (n >= N) return;
+    float total = 0.0f;
+    for (int j = 0; j < TOP; ++j) {
+        float wj = w[r * TOP + j];
+        if (HAS_GS) {
+            float s = gs[inds[r * TOP + j]] * inv_den[0];
+            wj = wj * s;
+        }
+        float p = static_cast<float>(z[((size_t)r * TOP + j) * N + n]) * wj;
+        total = p + total;
+    }
+    out[(size_t)r * N + n] = static_cast<T>(total);
+"""
+_moe_combine_kernel = None
+
+
+def moe_combine(z, weights, inds, global_scale, inv_den, out_dtype):
+    """``z`` [rows, top, N] (row-contiguous), ``weights`` [rows, top] FP32,
+    ``inds`` [rows, top] expert ids, ``global_scale`` [E] FP32 or None."""
+    global _moe_combine_kernel
+    if _moe_combine_kernel is None:
+        _moe_combine_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_moe_combine",
+            input_names=["z", "w", "inds", "gs", "inv_den"],
+            output_names=["out"],
+            source=_MOE_COMBINE_SOURCE,
+        )
+    rows, top, n = z.shape
+    has_gs = global_scale is not None
+    gs = global_scale if has_gs else mx.zeros((1,), mx.float32)
+    (out,) = _moe_combine_kernel(
+        inputs=[z, weights, inds, gs, mx.array([inv_den], dtype=mx.float32)],
+        template=[("T", out_dtype), ("TOP", top), ("N", n), ("HAS_GS", int(has_gs))],
+        grid=(n, rows, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, n)],
+        output_dtypes=[out_dtype],
+    )
+    return out
