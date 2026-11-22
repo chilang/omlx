@@ -766,7 +766,7 @@ _LOOP_GEMV_SOURCE = """
     uint col = threadgroup_position_in_grid.x * CPT + lane;
     uint bi = threadgroup_position_in_grid.y;
     const device bfloat16_t* wp = w + (size_t)bi * K * N + col;
-    const device float* zp = z + (size_t)bi * ROWS * K;
+    auto zp = z + (size_t)bi * ROWS * K;
     float acc[ROWS];
     for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
     // Weight loads for UNROLL blocks are issued before their FMAs (the
@@ -783,7 +783,7 @@ _LOOP_GEMV_SOURCE = """
             for (int tm = 0; tm < 4; ++tm) {
                 int k = (i0 + u) * 32 + j * 4 + tm;
                 for (int r = 0; r < ROWS; ++r) {
-                    float vc = zp[r * K + k];
+                    float vc = static_cast<float>(zp[r * K + k]);
                     acc[r] += vc * wv[u][tm];
                 }
             }
@@ -998,5 +998,174 @@ def moe_combine(z, weights, inds, global_scale, inv_den, out_dtype):
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, n)],
         output_dtypes=[out_dtype],
+    )
+    return out
+
+
+# Loop-controller message mix for decode/verify rows, in three kernels:
+#   mix_z: z = bf16(unit_rms(x)), bf16(unit_rms(message)) stacked as
+#     [N, 2, rows, H] (``rms_single_row`` arithmetic for an FP32 row);
+#   loop_gemv(z, down) (BF16 z reads equal the FP32 copy);
+#   loop_mix_up: low = bf16(sum of the two halves) on the fly, the gain/forget
+#     projection (``loop_gemv`` arithmetic), tanh and the gated combine.
+# Every step matches the stock ops bit for bit (tests/test_ops.py).
+_MIX_Z_SOURCE = """
+    constexpr int NR = 4;
+    uint q = threadgroup_position_in_grid.x;
+    uint lid = thread_position_in_threadgroup.x;
+    uint simd_lane_id = thread_index_in_simdgroup;
+    uint simd_group_id = simdgroup_index_in_threadgroup;
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
+    uint r = q % ROWS;
+    uint half_ = (q / ROWS) % 2;
+    uint i = q / (2 * ROWS);
+    size_t flat = ((size_t)i * ROWS + r) * D;
+    float xv[NR];
+    float acc = 0;
+    for (int k = 0; k < NR; k++) {
+        int c = lid * NR + k;
+        if (c < D) {
+            xv[k] = half_ == 0 ? x[elem_to_loc(flat + c, x_shape, x_strides, x_ndim)]
+                               : m[elem_to_loc(flat + c, m_shape, m_strides, m_ndim)];
+            acc += xv[k] * xv[k];
+        }
+    }
+    acc = simd_sum(acc);
+    if (simd_group_id == 0) {
+        local_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_lane_id == 0) {
+        local_sums[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+        acc = simd_sum(local_sums[simd_lane_id]);
+        if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / D + 1e-6f);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = local_inv_mean[0];
+    for (int k = 0; k < NR; k++) {
+        int c = lid * NR + k;
+        if (c < D) {
+            z[(size_t)q * D + c] = static_cast<bfloat16_t>(xv[k] * inv);
+        }
+    }
+"""
+_mix_z_kernel = None
+
+
+def mix_z(x, message):
+    """``stack([unit_rms(x), unit_rms(message)], 1).astype(bf16)`` reshaped to
+    [2N, rows, H]; ``x``/``message`` [N, B, L, H] FP32 (strided views ok)."""
+    global _mix_z_kernel
+    if _mix_z_kernel is None:
+        _mix_z_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mix_z",
+            input_names=["x", "m"],
+            output_names=["z"],
+            source=_MIX_Z_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    n, b, length, d = x.shape
+    rows = b * length
+    tg = ((d + 3) // 4 + 31) // 32 * 32
+    (z,) = _mix_z_kernel(
+        inputs=[x, message],
+        template=[("D", d), ("ROWS", rows)],
+        grid=(tg * 2 * n * rows, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[(2 * n, rows, d)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return z
+
+
+_LOOP_MIX_UP_SOURCE = """
+    uint t = thread_position_in_threadgroup.x;
+    uint lane = t % CPT;
+    uint j = t / CPT;
+    uint col = threadgroup_position_in_grid.x * CPT + lane;
+    uint bi = threadgroup_position_in_grid.y;
+    const device bfloat16_t* wp = w + (size_t)bi * K * N2 + col;
+    const device float* pa = parts + (size_t)(2 * bi) * ROWS * K;
+    const device float* pb = parts + (size_t)(2 * bi + 1) * ROWS * K;
+    float ag[ROWS];
+    float af[ROWS];
+    for (int r = 0; r < ROWS; ++r) { ag[r] = 0.0f; af[r] = 0.0f; }
+    for (int i0 = 0; i0 < K / 32; ++i0) {
+        for (int tm = 0; tm < 4; ++tm) {
+            int k = i0 * 32 + j * 4 + tm;
+            float wg = static_cast<float>(wp[(size_t)k * N2]);
+            float wf = static_cast<float>(wp[(size_t)k * N2 + H]);
+            for (int r = 0; r < ROWS; ++r) {
+                float s = 0.0f;
+                s = pa[r * K + k] + s;
+                s = pb[r * K + k] + s;
+                float vc = static_cast<float>(static_cast<bfloat16_t>(s));
+                ag[r] += vc * wg;
+                af[r] += vc * wf;
+            }
+        }
+    }
+    threadgroup float red[2][8][ROWS][CPT];
+    for (int r = 0; r < ROWS; ++r) { red[0][j][r][lane] = ag[r]; red[1][j][r][lane] = af[r]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (j == 0) {
+        for (int r = 0; r < ROWS; ++r) {
+            float g2[2];
+            for (int u = 0; u < 2; ++u) {
+                float p0 = red[u][0][r][lane], p1 = red[u][1][r][lane], p2 = red[u][2][r][lane], p3 = red[u][3][r][lane];
+                float p4 = red[u][4][r][lane], p5 = red[u][5][r][lane], p6 = red[u][6][r][lane], p7 = red[u][7][r][lane];
+                float a0 = p0 + p4, a1 = p1 + p5, a2 = p2 + p6, a3 = p3 + p7;
+                float b0 = a0 + a2, b1 = a1 + a3;
+                g2[u] = b0 + b1;
+            }
+            float gain = metal::precise::tanh(g2[0]);
+            float forget = metal::precise::tanh(g2[1]);
+            size_t flat = ((size_t)bi * ROWS + r) * H + col;
+            float xv = x[elem_to_loc(flat, x_shape, x_strides, x_ndim)];
+            float mv = m[elem_to_loc(flat, m_shape, m_strides, m_ndim)];
+            // Two products and a separate add, as the stock elementwise ops
+            // round them (no fused multiply-add).
+            {
+#pragma METAL fp contract(off)
+                float keep = (1.0f - forget) * xv;
+                float add = gain * mv;
+                out[flat] = keep + add;
+            }
+        }
+    }
+"""
+_loop_mix_up_kernel = None
+
+
+def loop_mix_up(parts, w, x, message):
+    """Second half of the loop-controller mix. ``parts`` [2N, rows, K] FP32
+    (down projection of the x and message halves), ``w`` [N, K, 2H] BF16,
+    ``x``/``message`` [N, B, L, H] FP32. Returns [N, B, L, H] FP32."""
+    global _loop_mix_up_kernel
+    if _loop_mix_up_kernel is None:
+        _loop_mix_up_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_loop_mix_up",
+            input_names=["parts", "w", "x", "m"],
+            output_names=["out"],
+            source=_LOOP_MIX_UP_SOURCE,
+            ensure_row_contiguous=False,
+        )
+    n, b, length, h = x.shape
+    rows = b * length
+    k = parts.shape[-1]
+    cpt = 32 if rows <= 8 else 16
+    (out,) = _loop_mix_up_kernel(
+        inputs=[parts, w, x, message],
+        template=[("K", k), ("H", h), ("N2", 2 * h), ("ROWS", rows), ("CPT", cpt)],
+        grid=((h // cpt) * 8 * cpt, n, 1),
+        threadgroup=(8 * cpt, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
     )
     return out

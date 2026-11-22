@@ -401,6 +401,9 @@ class AttnResQuery(nn.Module):
         return kernels.attn_res_mix(blocks, partial_n, self.query, self.scale)
 
 
+_FUSED_MIX = True
+
+
 def _mix_messages(x, message, down, gain_forget, bf16_weights=None):
     """Loop controllers: ``(1 - tanh(forget)) * x + tanh(gain) * message``.
 
@@ -413,6 +416,11 @@ def _mix_messages(x, message, down, gain_forget, bf16_weights=None):
     """
     n, b, length, hidden = x.shape
     rows = b * length
+    if bf16_weights is not None and rows <= _COMPILED_MAX_TOKENS and _FUSED_MIX:
+        # Decode/verify rows: norms + rounding, down projection, and
+        # up projection + gating in three kernels (bit-identical).
+        parts = kernels.loop_gemv(kernels.mix_z(x, message), bf16_weights[0])
+        return kernels.loop_mix_up(parts, bf16_weights[1], x, message)
     # Like the reference, the down projection takes BF16-rounded inputs,
     # accumulates in FP32 and rounds once. It runs as a batched matmul over
     # the halves: a single [rows, 2H] x [2H, r] matmul gets a row-count
