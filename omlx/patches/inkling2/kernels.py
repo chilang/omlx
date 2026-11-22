@@ -1825,3 +1825,95 @@ def mk_oproj(attn, sg, w, scales, biases, group_size, state, taps, cscale, wdtyp
         output_dtypes=[mx.float32, mx.float32],
     )
     return residual, nxt
+
+
+# ---------------------------------------------------------------------------
+# Megakernel slice 4 (OMLX_INKLING2_MK_ROUTER=1, with MK_MOE): the MLP input
+# norm, its BF16 rounding and the FP32 router GEMV in one dispatch.
+#   x = bf16(w * (y * inv)) with ``rms_single_row``'s inv (``_RAW_RMS_PROLOGUE``),
+#   logits = MLX ``gemv`` (BM 1, BN 8, SM 1, SN 32, TM 4, TN 4: matmul.cpp's
+#   pick for a [128, 2304] row-major matrix) over float(x).
+# The router rows a thread reads are loaded before the norm (they do not depend
+# on it); threadgroup 0 also writes x for the experts.
+# ---------------------------------------------------------------------------
+_MK_ROUTER_SOURCE = """
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    constexpr int TM = 4, TN = 4, SN = 32, BN = 8;
+    constexpr int BLOCKN = BN * SN * TN;
+    constexpr int NIT = H / BLOCKN;
+    constexpr int LEFT = H - NIT * BLOCKN;
+    constexpr int NB = NIT + (LEFT > 0 ? 1 : 0);
+    int out_row = threadgroup_position_in_grid.x * TM;
+    const device float* mat = rw + (size_t)out_row * H;
+    float wv[NB][TM][TN];
+    for (int i = 0; i < NB; ++i) {
+        int bn = (int)(sg * SN + lane) * TN + i * BLOCKN;
+        for (int tm = 0; tm < TM; ++tm)
+            for (int tn = 0; tn < TN; ++tn)
+                wv[i][tm][tn] = (bn + tn < H) ? mat[(size_t)tm * H + bn + tn] : 0.0f;
+    }
+    const device float* p = y;
+    const size_t base = 0;
+""" + _RAW_RMS_PROLOGUE + """
+    float result[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int i = 0; i < NB; ++i) {
+        int bn = (int)(sg * SN + lane) * TN + i * BLOCKN;
+        float vc[TN];
+        for (int tn = 0; tn < TN; ++tn) {
+            int c = bn + tn;
+            vc[tn] = (c < H) ? static_cast<float>(static_cast<bfloat16_t>(nw[c] * (y[c] * inv))) : 0.0f;
+        }
+        for (int tm = 0; tm < TM; ++tm)
+            for (int tn = 0; tn < TN; ++tn) {
+                if (FMA) result[tm] = metal::fma(wv[i][tm][tn], vc[tn], result[tm]);
+                else { float pr = wv[i][tm][tn] * vc[tn]; result[tm] = result[tm] + pr; }
+            }
+    }
+    for (int tm = 0; tm < TM; ++tm)
+        for (ushort sn = SN / 2; sn >= 1; sn >>= 1)
+            result[tm] += simd_shuffle_down(result[tm], sn);
+    threadgroup float tg[BN][TM];
+    if (lane == 0)
+        for (int tm = 0; tm < TM; ++tm) tg[sg][tm] = result[tm];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+        for (int tm = 0; tm < TM; ++tm) {
+            float r = tg[0][tm];
+            for (int s = 1; s < BN; ++s) r += tg[s][tm];
+            logits[out_row + tm] = r;
+        }
+    }
+    if (threadgroup_position_in_grid.x == 0) {
+        for (uint c = tid; c < H; c += TG)
+            xout[c] = static_cast<bfloat16_t>(nw[c] * (y[c] * inv));
+    }
+"""
+_mk_router_kernel = None
+# 1 = fma accumulation: bit-equal to MLX's precompiled fp32 gemv (tools/mk_unit.py 20/20; plain mul+add 0/20)
+MK_ROUTER_FMA = 1
+
+
+def mk_router(y, norm_w, router_w):
+    """y [.., H] FP32 MLP input before its norm, norm_w [H], router_w [E, H] FP32.
+    Returns (x [1, H] bf16 = rms_norm(y, w).astype(bf16), logits [1, E] FP32)."""
+    global _mk_router_kernel
+    if _mk_router_kernel is None:
+        _mk_router_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_router",
+            input_names=["y", "nw", "rw"],
+            output_names=["xout", "logits"],
+            source=_MK_ROUTER_SOURCE,
+        )
+    h = y.shape[-1]
+    e = router_w.shape[0]
+    x, logits = _mk_router_kernel(
+        inputs=[y.reshape(-1), norm_w.astype(mx.float32), router_w],
+        template=[("H", h), ("TG", 256), ("FMA", MK_ROUTER_FMA)],
+        grid=(256 * (e // 4), 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(1, h), (1, e)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )
+    return x, logits

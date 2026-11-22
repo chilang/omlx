@@ -522,6 +522,8 @@ _FUSED_DECODE_CONV = True
 _MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "") == "1"
 # Megakernel slice 2: single-token gated o_proj + attention conv + residual.
 _MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
+# Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
+_MK_ROUTER = os.environ.get("OMLX_INKLING2_MK_ROUTER", "") == "1"
 _taps_stacked: dict = {}
 
 
@@ -956,6 +958,13 @@ class Inkling2Layer(nn.Module):
                 self.loop_gain_forget[3:],
                 self.__dict__.get("_loop_bf16", (None, None))[1],
             )[0]
+        if (
+            _MK_MOE and _MK_ROUTER and y.dtype == mx.float32 and h.dtype == mx.bfloat16
+            and self.mlp_norm.eps == 1e-6 and self._mk_moe_ok(y, s3)
+        ):
+            x_mlp, logits = kernels.mk_router(y, self.mlp_norm.weight, self.mlp.router_weight)
+            h_out, s3 = self._mk_moe(x_mlp.reshape(h.shape), residual, s3, logits)
+            return h_out, s2, s3
         x_mlp = self.mlp_norm(y).astype(h.dtype)
         if _MK_MOE and self._mk_moe_ok(x_mlp, s3):
             h_out, s3 = self._mk_moe(x_mlp, residual, s3)
@@ -977,13 +986,14 @@ class Inkling2Layer(nn.Module):
             and self.mlp.router_weight.shape[0] % 32 == 0
         )
 
-    def _mk_moe(self, x, residual, s3):
+    def _mk_moe(self, x, residual, s3, logits=None):
         """Single-token MoE + MLP conv + residual add in four dispatches
         (router GEMV, top-k, ups, downs); same arithmetic as the stock path."""
         mlp = self.mlp
         ex = mlp.experts
         flat = x.reshape(1, -1)
-        logits = flat.astype(mx.float32) @ mlp.router_weight.T
+        if logits is None:
+            logits = flat.astype(mx.float32) @ mlp.router_weight.T
         inds, w = kernels.route_topk(logits, mlp.router_bias, mlp.top_k, mlp.route_scale)
         inv = 1.0 / _NVFP4_DENOMINATOR
         act = kernels.mk_moe_ups(
