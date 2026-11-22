@@ -626,9 +626,11 @@ class Inkling2Attention(nn.Module):
                 q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
             else:
                 kv_lin = self.__dict__.get("_kv_lin")
-                if kv_lin is None or not 2 <= length <= 4:
+                if kv_lin is None or not (2 <= length <= 4 or length > 256):
                     # (Stock qmm rounds an L-row call like the stacked 3L-row
-                    # one only for L in 2..4, so other lengths stay stacked.)
+                    # one only for L in 2..4 and L > 256 (measured on MLX
+                    # 0.32.4, 8-bit g64, 2304 -> 8600); other lengths stay
+                    # stacked. Prefill chunks skip 2/3 of the stacked work.)
                     # Looped passes give q, k and v their own inputs; one
                     # stacked projection serves all three.
                     pq, pk, pv = mx.split(
