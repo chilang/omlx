@@ -875,8 +875,8 @@ def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int
 # ``out = xf * min(thr / (||xf|| + 1e-6), 1)`` cast to ``x.dtype``, in one
 # kernel instead of multiply + square + row sum + elementwise tail. The row
 # sum follows MLX's own row reduction for a contiguous last-axis sum, so the
-# result is bit-identical: rows of R <= 64 use ``row_reduce_small`` (one
-# thread, sequential); longer rows use ``row_reduce_simple`` (32 lanes, four
+# result is bit-identical: rows of R <= 32 follow ``row_reduce_small`` (one
+# thread, sequential; here lanes load and lane order is kept by shuffles); longer rows use ``row_reduce_simple`` (32 lanes, four
 # consecutive elements each, summed in order, then ``simd_sum``).
 _L2_CLIP_SOURCE = """
     uint row = threadgroup_position_in_grid.x;
@@ -884,19 +884,22 @@ _L2_CLIP_SOURCE = """
     const float t = thr[0];
     size_t base = elem_to_loc((size_t)row * R, x_shape, x_strides, x_ndim);
     uint srow = SH ? (row % (SH ? SH : 1)) * R : 0;
-    if (R <= 64) {
-        if (lane == 0) {
-            float total = 0.0f;
-            for (int i = 0; i < R; ++i) {
-                float xf = static_cast<float>(x[base + i]) * static_cast<float>(scale[SH ? srow + i : 0]);
-                float sq = xf * xf;
-                total = sq + total;
-            }
-            float m = metal::min(t / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
-            for (int i = 0; i < R; ++i) {
-                float xf = static_cast<float>(x[base + i]) * static_cast<float>(scale[SH ? srow + i : 0]);
-                out[(size_t)row * R + i] = static_cast<T>(xf * m);
-            }
+    if (R <= 32) {
+        // Lane i loads element i; the squares are then summed in order
+        // (as one MLX thread would) through shuffles, all lanes in lockstep.
+        float v = 0.0f;
+        if ((int)lane < R) {
+            v = static_cast<float>(x[base + lane]) * static_cast<float>(scale[SH ? srow + lane : 0]);
+        }
+        float sq = v * v;
+        float total = 0.0f;
+        for (int i = 0; i < R; ++i) {
+            float si = simd_shuffle(sq, (ushort)i);
+            total = si + total;
+        }
+        float m = metal::min(t / (metal::precise::sqrt(total) + 1e-6f), 1.0f);
+        if ((int)lane < R) {
+            out[(size_t)row * R + lane] = static_cast<T>(v * m);
         }
     } else {
         float xf[R / 32 > 0 ? R / 32 : 1];
@@ -926,7 +929,7 @@ _l2_clip_kernel = None
 def fused_l2_clip(x, scale, threshold):
     """``_l2_clip`` in one kernel. ``x`` [..., R] (last axis contiguous),
     ``scale`` [SH, R] broadcast over the leading rows or a scalar, ``threshold``
-    a scalar FP32 array. R must be <= 64 or a multiple of 128."""
+    a scalar FP32 array. R must be <= 32 or a multiple of 128."""
     global _l2_clip_kernel
     if _l2_clip_kernel is None:
         _l2_clip_kernel = mx.fast.metal_kernel(

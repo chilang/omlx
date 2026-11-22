@@ -146,7 +146,7 @@ def _softcap(x: mx.array, cap: float) -> mx.array:
 def _l2_clip(x: mx.array, scale: mx.array, threshold: mx.array) -> mx.array:
     # Decode/verify rows: one fused kernel, bit-identical to the ops below.
     if x.ndim == 4 and x.shape[0] * x.shape[1] <= _COMPILED_MAX_TOKENS and (
-        x.shape[-1] <= 64 or x.shape[-1] % 128 == 0
+        x.shape[-1] <= 32 or x.shape[-1] % 128 == 0
     ):
         return kernels.fused_l2_clip(x, scale, threshold)
     return _l2_clip_ops(x, scale, threshold)
