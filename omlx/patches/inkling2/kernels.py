@@ -16,14 +16,14 @@ _ATTN_RES_TG = 256
 _attn_res_kernels: dict = {}
 
 
-def _attn_res_kernel(blocks: int, queries: int):
+def _attn_res_kernel(blocks: int, queries: int, raw: bool = False):
     """Fused depth mixing for ``blocks`` completed blocks plus the partial sum.
 
     One threadgroup per token row: dot products of every source with every
     query, softmax over sources, then the weighted sum, without stacking the
     sources.
     """
-    key = (blocks, queries)
+    key = (blocks, queries, raw)
     kernel = _attn_res_kernels.get(key)
     if kernel is not None:
         return kernel
@@ -31,6 +31,12 @@ def _attn_res_kernel(blocks: int, queries: int):
     loads = "\n".join(
         f"        float s{i} = {name}[base + h];" for i, name in enumerate(srcs)
     )
+    if raw:
+        # The partial sum arrives un-normalised; scale by the unit-RMS factor.
+        loads = loads.replace(
+            f"float s{blocks} = p[base + h];",
+            f"float s{blocks} = static_cast<float>(p[base + h]) * inv;",
+        )
     dots = "\n".join(
         f"        acc[{i} * Q + qi] += s{i} * qv;" for i in range(len(srcs))
     )
@@ -42,6 +48,7 @@ def _attn_res_kernel(blocks: int, queries: int):
     uint lane = thread_index_in_simdgroup;
     uint sg = simdgroup_index_in_threadgroup;
     size_t base = (size_t)row * H;
+{_RAW_RMS_PROLOGUE if raw else ""}
     float acc[NS * Q];
     for (uint i = 0; i < NS * Q; ++i) acc[i] = 0.0f;
     for (uint h = tid; h < H; h += TG) {{
@@ -50,6 +57,7 @@ def _attn_res_kernel(blocks: int, queries: int):
             float qv = query[qi * H + h];
 {dots}
         }}
+{"        pn[base + h] = s" + str(blocks) + ";" if raw else ""}
     }}
     threadgroup float red[NS * Q][TG / 32];
     for (uint i = 0; i < NS * Q; ++i) {{
@@ -81,13 +89,75 @@ def _attn_res_kernel(blocks: int, queries: int):
     }}
 """
     kernel = mx.fast.metal_kernel(
-        name=f"omlx_inkling2_attn_res_{blocks}_{queries}",
+        name=f"omlx_inkling2_attn_res_{blocks}_{queries}{'_raw' if raw else ''}",
         input_names=[*srcs, "query", "scale"],
-        output_names=["out"],
+        output_names=["out", "pn"] if raw else ["out"],
         source=source,
     )
     _attn_res_kernels[key] = kernel
     return kernel
+
+
+# Unit-RMS factor of the raw partial sum, with MLX's ``rms_single_row``
+# arithmetic for an FP32 row of H: 4 consecutive elements per thread over
+# ceil(H/4) threads rounded up to whole simdgroups, simd_sum per simdgroup,
+# then simd_sum of the (zero-padded) 32 simdgroup sums and precise rsqrt.
+# The TG real threads cover those virtual threads in rounds, keeping each
+# virtual simdgroup on one real simdgroup, so every sum groups identically.
+_RAW_RMS_PROLOGUE = """
+    threadgroup float rms_sums[32];
+    threadgroup float rms_inv[1];
+    if (tid < 32) rms_sums[tid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    constexpr uint VT = ((H + 3) / 4 + 31) / 32 * 32;
+    for (uint r0 = 0; r0 < VT; r0 += TG) {
+        uint vt = r0 + tid;
+        float racc = 0.0f;
+        if (vt < VT) {
+            for (int i = 0; i < 4; i++) {
+                uint c = vt * 4 + i;
+                if (c < H) {
+                    float xi = static_cast<float>(p[base + c]);
+                    racc += xi * xi;
+                }
+            }
+        }
+        racc = simd_sum(racc);
+        uint vsg = (r0 + sg * 32) / 32;
+        if (lane == 0 && vsg < 32) rms_sums[vsg] = racc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float tot = simd_sum(rms_sums[lane]);
+        if (lane == 0) rms_inv[0] = metal::precise::rsqrt(tot / H + 1e-6f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv = rms_inv[0];
+"""
+
+
+def attn_res_mix_raw(blocks: list, partial: mx.array, query: mx.array, scale: float):
+    """``attn_res_mix(blocks, unit_rms(partial.astype(f32)), ...)`` with the
+    norm computed in the same kernel (bit-identical). Returns the mixtures
+    and the unit-RMS partial sum [B, L, H] FP32."""
+    b, length, hidden = partial.shape
+    nq = query.shape[0]
+    rows = b * length
+    kernel = _attn_res_kernel(len(blocks), nq, raw=True)
+    out, pn = kernel(
+        inputs=[
+            *[x.astype(mx.float32) for x in blocks],
+            partial,
+            query.astype(mx.float32),
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=[("H", hidden), ("Q", nq), ("TG", _ATTN_RES_TG)],
+        grid=(rows * _ATTN_RES_TG, 1, 1),
+        threadgroup=(_ATTN_RES_TG, 1, 1),
+        output_shapes=[(b, length, nq, hidden), (b, length, hidden)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return out, pn
 
 
 def attn_res_mix(blocks: list, partial_n: mx.array, query: mx.array, scale: float):

@@ -772,11 +772,18 @@ class Inkling2Layer(nn.Module):
 
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
-        h_n = _unit_rms(h.astype(mx.float32))
+        small = h.shape[0] * h.shape[1] <= _COMPILED_MAX_TOKENS
         if self.layer_idx == 0:
+            h_n = _unit_rms(h.astype(mx.float32))
             xq = xk = xv = h
         else:
-            mixed = self.attn_input(blocks, h_n)
+            if small:
+                # The partial sum's unit-RMS inside the mixing kernel.
+                q = self.attn_input
+                mixed, h_n = kernels.attn_res_mix_raw(blocks, h, q.query, q.scale)
+            else:
+                h_n = _unit_rms(h.astype(mx.float32))
+                mixed = self.attn_input(blocks, h_n)
             if self.sliding:
                 xq = xk = xv = mixed[:, :, 0]
             else:
@@ -809,7 +816,11 @@ class Inkling2Layer(nn.Module):
             residual = a.astype(mx.float32)
         else:
             residual = h.astype(mx.float32) + a.astype(mx.float32)
-        y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
+        if residual.shape[0] * residual.shape[1] <= _COMPILED_MAX_TOKENS:
+            q = self.mlp_input
+            y = kernels.attn_res_mix_raw(mlp_blocks, residual, q.query, q.scale)[0][:, :, 0]
+        else:
+            y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
         if messages is not None:
             y = _mix_messages(
                 y[None],
