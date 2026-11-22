@@ -1663,8 +1663,8 @@ _mk_downs_kernel = None
 # r1 steps, tools/mk_equal.py); 1 = explicit fma (differs).
 MK_COMBINE_FMA = 0
 # Output rows per simdgroup in ups / downs (per-row arithmetic unchanged).
-MK_UPS_RPS = 4
-MK_DOWNS_RPS = 4
+MK_UPS_RPS = 2
+MK_DOWNS_RPS = 2
 
 
 def mk_moe_ups(x, w, scales, inds, gs, inv_den, caps):
