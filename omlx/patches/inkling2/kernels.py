@@ -1529,12 +1529,13 @@ def scaled_swiglu(y, global_scale, inds, inv_den, caps, sdiv=1):
 # ---------------------------------------------------------------------------
 _NVFP4_DOT_BODY = """
     // MLX fp_qmv traversal for NVFP4 of 4 rows (``_NVFP4_ROWS_SOURCE``, one pair).
-    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float result[RPS];
+    for (int r = 0; r < RPS; ++r) result[r] = 0.0f;
     for (int k = 0; k < KD; k += 256) {
         if (k + (int)lane * 8 < KD) {
-            float s[4];
-            float wd[4][8];
-            for (int r = 0; r < 4; ++r) {
+            float s[RPS];
+            float wd[RPS][8];
+            for (int r = 0; r < RPS; ++r) {
                 const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
                 for (int i = 0; i < 2; ++i) {
                     ushort q = w16[i];
@@ -1552,7 +1553,7 @@ _NVFP4_DOT_BODY = """
             for (int i = 0; i < 8; ++i) {
                 xt[i] = float(xs[k + i]);
             }
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < RPS; ++r) {
                 float accum = 0.0f;
                 for (int i = 0; i < 2; ++i) {
                     accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
@@ -1564,8 +1565,8 @@ _NVFP4_DOT_BODY = """
         ws += 128;
         sc += 16;
     }
-    T z[4];
-    for (int r = 0; r < 4; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
+    T z[RPS];
+    for (int r = 0; r < RPS; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
 """
 
 # grid (64 * (2I / 8), TOP), threadgroup 64: simdgroup g of threadgroup x owns
@@ -1580,13 +1581,13 @@ _MK_UPS_SOURCE = """
     constexpr int N = 2 * I;
     constexpr int KW = KD / 8;
     constexpr int KG = KD / 16;
-    int out_row = threadgroup_position_in_grid.x * 8 + simd_gid * 4;
+    int out_row = threadgroup_position_in_grid.x * (2 * RPS) + simd_gid * RPS;
     const device uint8_t* ws =
         (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
     const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
     const device T* xs = x + lane * 8;
 """ + _NVFP4_DOT_BODY + """
-    if (lane < 2) {
+    if (lane < RPS / 2) {
         float g = static_cast<float>(z[2 * lane]);
         float u = static_cast<float>(z[2 * lane + 1]);
         float sv = gs[e] * inv_den[0];
@@ -1615,18 +1616,18 @@ _MK_DOWNS_SOURCE = """
     constexpr int N = H;
     constexpr int KW = KD / 8;
     constexpr int KG = KD / 16;
-    int out_row = threadgroup_position_in_grid.y * 4;
+    int out_row = threadgroup_position_in_grid.y * RPS;
     const device uint8_t* ws =
         (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
     const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
     const device T* xs = act + (size_t)j * I + lane * 8;
 """ + _NVFP4_DOT_BODY + """
-    threadgroup float tz[TOP][4];
+    threadgroup float tz[TOP][RPS];
     if (lane == 0) {
-        for (int r = 0; r < 4; ++r) tz[j][r] = static_cast<float>(z[r]);
+        for (int r = 0; r < RPS; ++r) tz[j][r] = static_cast<float>(z[r]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (j == 0 && lane < 4) {
+    if (j == 0 && lane < RPS) {
         uint c = out_row + lane;
         float total = 0.0f;
         for (int t = 0; t < TOP; ++t) {
@@ -1661,6 +1662,9 @@ _mk_downs_kernel = None
 # 0 = plain multiply then add (bit-equal to the incumbent moe_combine on 16 chained
 # r1 steps, tools/mk_equal.py); 1 = explicit fma (differs).
 MK_COMBINE_FMA = 0
+# Output rows per simdgroup in ups / downs (per-row arithmetic unchanged).
+MK_UPS_RPS = 4
+MK_DOWNS_RPS = 4
 
 
 def mk_moe_ups(x, w, scales, inds, gs, inv_den, caps):
@@ -1679,8 +1683,8 @@ def mk_moe_ups(x, w, scales, inds, gs, inv_den, caps):
     h = x.shape[-1]
     (act,) = _mk_ups_kernel(
         inputs=[x, w, scales, inds.reshape(-1), gs, mx.array([inv_den], dtype=mx.float32), caps],
-        template=[("T", x.dtype), ("H", h), ("I", n2 // 2)],
-        grid=(64 * (n2 // 8), top, 1),
+        template=[("T", x.dtype), ("H", h), ("I", n2 // 2), ("RPS", MK_UPS_RPS)],
+        grid=(64 * (n2 // (2 * MK_UPS_RPS)), top, 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(top, n2 // 2)],
         output_dtypes=[x.dtype],
@@ -1710,8 +1714,8 @@ def mk_moe_downs(act, w, scales, inds, weights, gs, inv_den, residual, state, ta
                 mx.array([inv_den], dtype=mx.float32), residual.reshape(-1),
                 mx.contiguous(state), taps, mx.array([cscale], dtype=mx.float32)],
         template=[("T", act.dtype), ("W", wdtype), ("H", h), ("I", i), ("TOP", top),
-                  ("KT", kt), ("COMBINE_FMA", MK_COMBINE_FMA)],
-        grid=(32 * top, h // 4, 1),
+                  ("KT", kt), ("COMBINE_FMA", MK_COMBINE_FMA), ("RPS", MK_DOWNS_RPS)],
+        grid=(32 * top, h // MK_DOWNS_RPS, 1),
         threadgroup=(32 * top, 1, 1),
         output_shapes=[(1, 1, h), (1, kt - 1, h)],
         output_dtypes=[act.dtype, mx.float32],
