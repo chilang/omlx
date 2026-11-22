@@ -1792,13 +1792,14 @@ _MK_OPROJ_SOURCE = """
     constexpr int KW = K;            // bytes per weight row (8-bit)
     constexpr int KG = K / GS;
     constexpr int SSTEP = GS / VPT;
-    int out_row = threadgroup_position_in_grid.y * 8 + simd_gid * 4;
+    int out_row = threadgroup_position_in_grid.y * (2 * RPO) + simd_gid * RPO;
     const device uint8_t* ws = (const device uint8_t*)w + (size_t)out_row * KW + simd_lid * VPT;
     const device T* sl0 = scales + (size_t)out_row * KG + simd_lid / SSTEP;
     const device T* bl0 = biases + (size_t)out_row * KG + simd_lid / SSTEP;
     const device T* xa = attn + simd_lid * VPT;
     const device float* xg = sg + simd_lid * VPT;
-    float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float result[RPO];
+    for (int r = 0; r < RPO; ++r) result[r] = 0.0f;
     for (int k = 0; k < K; k += BLOCK) {
         float xt[VPT];
         float sum = 0.0f;
@@ -1807,7 +1808,7 @@ _MK_OPROJ_SOURCE = """
             sum += static_cast<float>(xv);
             xt[i] = static_cast<float>(xv);
         }
-        for (int r = 0; r < 4; ++r) {
+        for (int r = 0; r < RPO; ++r) {
             const device uint8_t* wl = ws + r * KW;
             float s = static_cast<float>(sl0[r * KG]);
             float b = static_cast<float>(bl0[r * KG]);
@@ -1829,7 +1830,7 @@ _MK_OPROJ_SOURCE = """
         sl0 += BLOCK / GS;
         bl0 += BLOCK / GS;
     }
-    for (int r = 0; r < 4; ++r) {
+    for (int r = 0; r < RPO; ++r) {
         float v = simd_sum(result[r]);
         if (simd_lid == 0) {
             uint c = out_row + r;
@@ -1853,6 +1854,8 @@ _MK_OPROJ_SOURCE = """
 _mk_oproj_kernel = None
 # 1 = fma(scale, accum, sum * bias), as MLX 0.32.4's precompiled qmv rounds (tools/mk_unit.py: 20/20 equal; 0 and 4 differ)
 MK_OPROJ_VAR = 1
+# o_proj output rows per simdgroup (4 = MLX qmv_fast; per-row arithmetic unchanged).
+MK_OPROJ_RPS = 1
 
 
 def mk_oproj(attn, sg, w, scales, biases, group_size, state, taps, cscale, wdtype, h, boundary):
@@ -1875,8 +1878,8 @@ def mk_oproj(attn, sg, w, scales, biases, group_size, state, taps, cscale, wdtyp
         inputs=[attn.reshape(-1), sg.reshape(-1), w, scales, biases, mx.contiguous(state), taps,
                 mx.array([cscale], dtype=mx.float32), h.reshape(-1)],
         template=[("T", attn.dtype), ("W", wdtype), ("K", k), ("N", n), ("GS", group_size),
-                  ("KT", kt), ("BOUND", int(boundary)), ("VAR", MK_OPROJ_VAR)],
-        grid=(64, n // 8, 1),
+                  ("KT", kt), ("BOUND", int(boundary)), ("VAR", MK_OPROJ_VAR), ("RPO", MK_OPROJ_RPS)],
+        grid=(64, n // (2 * MK_OPROJ_RPS), 1),
         threadgroup=(64, 1, 1),
         output_shapes=[(1, 1, n), (1, kt - 1, n)],
         output_dtypes=[mx.float32, mx.float32],
