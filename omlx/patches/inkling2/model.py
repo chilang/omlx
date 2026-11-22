@@ -530,6 +530,28 @@ def _row_slice_qlinear(lin, start, stop):
     return q
 
 
+# Prefill chunks of at least this many rows run the 8-bit attention projections
+# as dequantize + BF16 GEMM. On MLX 0.32.4 that is bit-equal to the stock qmm
+# for M >= 600 on every projection shape here (measured to 12288 rows; it
+# differs below ~600) and ~25% faster at 2048 rows.
+_DQ_GEMM_MIN_ROWS = 1024
+
+
+def _proj(lin, x):
+    if (
+        _DQ_GEMM_MIN_ROWS
+        and x.size // x.shape[-1] >= _DQ_GEMM_MIN_ROWS
+        and isinstance(lin, nn.QuantizedLinear)
+        and getattr(lin, "mode", "affine") == "affine"
+        and lin.bits == 8
+        and "bias" not in lin
+        and x.dtype == lin.scales.dtype
+    ):
+        w = mx.dequantize(lin.weight, lin.scales, lin.biases, lin.group_size, lin.bits)
+        return x @ w.T
+    return lin(x)
+
+
 class Inkling2Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -623,7 +645,7 @@ class Inkling2Attention(nn.Module):
         dkv = self.dkv
         if self.sliding:
             if xk is None:
-                q, k, v, r, gate, sink = mx.split(self.in_proj(xq), self._cuts, axis=-1)
+                q, k, v, r, gate, sink = mx.split(_proj(self.in_proj, xq), self._cuts, axis=-1)
             else:
                 kv_lin = self.__dict__.get("_kv_lin")
                 if kv_lin is None or not (2 <= length <= 4 or length > 256):
@@ -640,8 +662,8 @@ class Inkling2Attention(nn.Module):
                     v = pv[..., self._cuts[1] : self._cuts[2]]
                 else:
                     # k and v through only their own rows of in_proj.
-                    pq = self.in_proj(xq)
-                    k, v = kv_lin[0](xk), kv_lin[1](xv)
+                    pq = _proj(self.in_proj, xq)
+                    k, v = _proj(kv_lin[0], xk), _proj(kv_lin[1], xv)
                 q, _, _, r, gate, sink = mx.split(pq, self._cuts, axis=-1)
             k, ks = _static_conv(
                 k, self._k_taps, ks, self._sconv_scale, self.k_conv.dtype
@@ -650,9 +672,9 @@ class Inkling2Attention(nn.Module):
                 v, self._v_taps, vs, self._sconv_scale, self.v_conv.dtype
             )
         else:
-            q, r, gate, sink = mx.split(self.q_proj(xq), self._cuts, axis=-1)
-            kp = self.k_proj(xk)
-            vp = self.v_proj(xv)
+            q, r, gate, sink = mx.split(_proj(self.q_proj, xq), self._cuts, axis=-1)
+            kp = _proj(self.k_proj, xk)
+            vp = _proj(self.v_proj, xv)
             k, ks = _dynamic_conv(
                 kp[..., :dkv],
                 kp[..., dkv:],
@@ -718,7 +740,7 @@ class Inkling2Attention(nn.Module):
         out = (out.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(
             gate.dtype
         )
-        return self.o_proj(out)
+        return _proj(self.o_proj, out)
 
 
 def _cumsum(xs):
