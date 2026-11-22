@@ -1581,7 +1581,7 @@ _MK_UPS_SOURCE = """
     constexpr int N = 2 * I;
     constexpr int KW = KD / 8;
     constexpr int KG = KD / 16;
-    int out_row = threadgroup_position_in_grid.x * (2 * RPS) + simd_gid * RPS;
+    int out_row = threadgroup_position_in_grid.x * (SGS * RPS) + simd_gid * RPS;
     const device uint8_t* ws =
         (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
     const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
@@ -1665,6 +1665,8 @@ MK_COMBINE_FMA = 0
 # Output rows per simdgroup in ups / downs (per-row arithmetic unchanged).
 MK_UPS_RPS = 2
 MK_DOWNS_RPS = 2
+# ups simdgroups per threadgroup.
+MK_UPS_SGS = 2
 
 
 def mk_moe_ups(x, w, scales, inds, gs, inv_den, caps):
@@ -1683,9 +1685,9 @@ def mk_moe_ups(x, w, scales, inds, gs, inv_den, caps):
     h = x.shape[-1]
     (act,) = _mk_ups_kernel(
         inputs=[x, w, scales, inds.reshape(-1), gs, mx.array([inv_den], dtype=mx.float32), caps],
-        template=[("T", x.dtype), ("H", h), ("I", n2 // 2), ("RPS", MK_UPS_RPS)],
-        grid=(64 * (n2 // (2 * MK_UPS_RPS)), top, 1),
-        threadgroup=(64, 1, 1),
+        template=[("T", x.dtype), ("H", h), ("I", n2 // 2), ("RPS", MK_UPS_RPS), ("SGS", MK_UPS_SGS)],
+        grid=(32 * MK_UPS_SGS * (n2 // (MK_UPS_SGS * MK_UPS_RPS)), top, 1),
+        threadgroup=(32 * MK_UPS_SGS, 1, 1),
         output_shapes=[(top, n2 // 2)],
         output_dtypes=[x.dtype],
     )
