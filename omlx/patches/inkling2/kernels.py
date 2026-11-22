@@ -819,6 +819,7 @@ inline float fp4v(ushort b) {
 }
 """
 _nvfp4_rows_kernel = None
+_nvfp4_rows_exact_kernel = None
 
 
 # Loop-controller projections for decode/verify-sized rows: FP32 inputs times
@@ -911,7 +912,7 @@ def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int
     bounds how many pairs share one expert. Returns [P, N] in ``x.dtype``,
     without the NVFP4 tensor scale (like ``gather_qmm``).
     """
-    global _nvfp4_rows_kernel
+    global _nvfp4_rows_kernel, _nvfp4_rows_exact_kernel
     if _nvfp4_rows_kernel is None:
         _nvfp4_rows_kernel = mx.fast.metal_kernel(
             name="omlx_inkling2_nvfp4_gather_rows",
@@ -920,10 +921,23 @@ def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int
             header=_NVFP4_ROWS_HEADER,
             source=_NVFP4_ROWS_SOURCE,
         )
+        # MLX's precompiled qmv does not fuse the multiply-adds; this JIT
+        # kernel would, and the one-ulp differences then flip a bf16 output
+        # now and then (why loop attempt 6 failed the server guard). The
+        # single-row decode call uses the unfused variant, bit-identical to
+        # gather_qmm; verify rows keep the faster fused one.
+        _nvfp4_rows_exact_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_nvfp4_gather_rows_exact",
+            input_names=["x", "w", "scales", "sorted_e", "order"],
+            output_names=["y"],
+            header=_NVFP4_ROWS_HEADER,
+            source="#pragma METAL fp contract(off)\n" + _NVFP4_ROWS_SOURCE,
+        )
+    kernel = _nvfp4_rows_exact_kernel if max_rows == 1 else _nvfp4_rows_kernel
     pairs = order.shape[0]
     n = w.shape[1]
     k = x.shape[-1]
-    (y,) = _nvfp4_rows_kernel(
+    (y,) = kernel(
         inputs=[x, w, scales, sorted_e, order],
         template=[
             ("T", x.dtype),
