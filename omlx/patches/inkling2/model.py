@@ -168,6 +168,11 @@ def _softcapped_swiglu(gate: mx.array, up: mx.array, gcap: mx.array, ucap: mx.ar
     return out.astype(dtype)
 
 
+# Routed-expert activation (NVFP4 scale + softcapped SwiGLU) as one kernel, and
+# single-row routing that also emits the expert-sorted order (bit-equal).
+_FUSED_ACT = True
+_SORTED_ROUTE = True
+
 # Row batches up to this size (speculative verify) take the expert-grouped
 # NVFP4 kernel; its bit-exactness to gather_qmm is tested at 1..8 rows.
 _GROUPED_MAX_ROWS = 8
@@ -291,20 +296,29 @@ class Inkling2Experts(nn.Module):
         self.w2 = ExpertProj(e, h, i, w2_spec)
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+        self._caps = mx.array([args.mlp_gate_softcap, args.mlp_up_softcap], dtype=mx.float32)
 
-    def _grouped_nvfp4(self, x, inds, weights):
+    def _grouped_nvfp4(self, x, inds, weights, order=None, sorted_e=None):
         """Verify-sized rows: each distinct expert's weights are read once for
         all pairs routed to it (``kernels.nvfp4_gather_rows``, bit-exact to
         ``gather_qmm``)."""
         rows, top = inds.shape
-        flat = inds.reshape(-1)
-        order = mx.argsort(flat).astype(mx.uint32)
-        sorted_e = flat[order]
+        if order is None:
+            flat = inds.reshape(-1)
+            order = mx.argsort(flat).astype(mx.uint32)
+            sorted_e = flat[order]
         y = kernels.nvfp4_gather_rows(
             x, self.w13.weight, self.w13.scales, order, sorted_e, top, rows
-        ).reshape(rows, top, 1, -1)
-        y = y * self.w13.post_scale(inds)[..., None, None].astype(y.dtype)
-        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+        )
+        if _FUSED_ACT:
+            act = kernels.scaled_swiglu(
+                y.reshape(rows * top, -1), self.w13.global_scale, inds,
+                1.0 / _NVFP4_DENOMINATOR, self._caps,
+            )
+        else:
+            y = y.reshape(rows, top, 1, -1)
+            y = y * self.w13.post_scale(inds)[..., None, None].astype(y.dtype)
+            act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
         z = kernels.nvfp4_gather_rows(
             act.reshape(rows * top, -1),
             self.w2.weight,
@@ -336,10 +350,18 @@ class Inkling2Experts(nn.Module):
         if do_sort:
             xe, idx, inv = _gather_sort(xe, inds)
         y = self.w13(xe, idx, do_sort)
-        s13 = self.w13.post_scale(idx)
-        if s13 is not None:
-            y = y * s13[..., None, None].astype(y.dtype)
-        act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
+        if _FUSED_ACT and do_sort and y.dtype == mx.bfloat16:
+            # Sorted pairs: y [P, 1, 2I], idx [P] (one expert per pair).
+            act = kernels.scaled_swiglu(
+                y.reshape(y.shape[0], -1),
+                self.w13.global_scale if self.w13.mode == "nvfp4" else None,
+                idx, 1.0 / _NVFP4_DENOMINATOR, self._caps,
+            ).reshape(y.shape[0], 1, -1)
+        else:
+            s13 = self.w13.post_scale(idx)
+            if s13 is not None:
+                y = y * s13[..., None, None].astype(y.dtype)
+            act = _softcapped_swiglu(y[..., 0::2], y[..., 1::2], self._gcap, self._ucap)
         z = self.w2(act, idx, do_sort)
         if do_sort and _FUSED_PREFILL_GLUE and inds.shape[0] > _COMPILED_MAX_TOKENS:
             return kernels.moe_combine_sorted(
@@ -391,8 +413,22 @@ class Inkling2MoE(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         shape = x.shape
         flat = x.reshape(-1, shape[-1])
+        ex = self.experts
+        if (
+            _SORTED_ROUTE
+            and flat.shape[0] == 1
+            and ex.w13.mode == "nvfp4"
+            and ex.w2.mode == "nvfp4"
+            and mx.default_device() == mx.gpu
+            and self.router_weight.shape[0] % 32 == 0
+        ):
+            logits = flat.astype(mx.float32) @ self.router_weight.T
+            inds, w, order, sorted_e = kernels.route_topk_sorted(
+                logits, self.router_bias, self.top_k, self.route_scale
+            )
+            return ex._grouped_nvfp4(flat, inds, w, order, sorted_e).reshape(shape)
         inds, w = self.route(flat)
-        return self.experts(flat, inds, w).reshape(shape)
+        return ex(flat, inds, w).reshape(shape)
 
 
 class AttnResQuery(nn.Module):
@@ -478,6 +514,9 @@ def _conv_taps(w):
 # Prefill rows (> _COMPILED_MAX_TOKENS, batch 1) run the static conv and the
 # routed-expert combine as single kernels (bit-equal to the ops below).
 _FUSED_PREFILL_GLUE = True
+# Single-token decode takes the same conv kernel (output and next state in one
+# dispatch). Verify widths (2..16 rows) keep the ops: rollback needs the window.
+_FUSED_DECODE_CONV = True
 _taps_stacked: dict = {}
 
 
@@ -499,7 +538,7 @@ def _static_conv(x, taps, state, scale, wdtype):
     if (
         _FUSED_PREFILL_GLUE
         and x.shape[0] == 1
-        and x.shape[1] > _COMPILED_MAX_TOKENS
+        and (x.shape[1] > _COMPILED_MAX_TOKENS or (x.shape[1] == 1 and _FUSED_DECODE_CONV))
         and state.dtype == mx.float32
     ):
         # The second result holds only the next state (the window's last

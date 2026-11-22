@@ -1325,15 +1325,21 @@ _STATIC_CONV_SOURCE = """
     float xf = rr[K - 1];
     float y = (static_cast<float>(static_cast<W>(o)) + xf) * scale[0];
     out[(size_t)i * C + c] = static_cast<T>(y);
-    if (int(i) >= L - (K - 1)) {
-        next_state[(size_t)(int(i) - (L - (K - 1))) * C + c] = xf;
+    if (i == 0) {
+        // Next state = the last K-1 rows of the window [state, x].
+        for (int t = 0; t < K - 1; ++t) {
+            int w = L + t;
+            next_state[(size_t)t * C + c] = w < K - 1
+                ? state[(size_t)w * C + c]
+                : static_cast<float>(x[(size_t)(w - (K - 1)) * xr + c * xc]);
+        }
     }
 """
 _static_conv_kernel = None
 
 
 def static_conv_prefill(x, taps, state, scale, wdtype):
-    """``x`` [1, L, C] (any strides, L >= K), ``taps`` [K, C] FP32 (tap j at
+    """``x`` [1, L, C] (any strides, any L >= 1), ``taps`` [K, C] FP32 (tap j at
     row j), ``state`` [1, K-1, C] FP32. Returns (out [1, L, C] x.dtype,
     next state [1, K-1, C] FP32)."""
     global _static_conv_kernel
@@ -1408,5 +1414,106 @@ def moe_combine_sorted(zs, inv, weights, inds, global_scale, inv_den, out_dtype)
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, n)],
         output_dtypes=[out_dtype],
+    )
+    return out
+
+
+# Single-row routing that also emits the expert-sorted pair order (what
+# ``argsort(inds.flatten())`` and the sorted-expert gather produce for one row
+# of distinct experts), so the grouped expert kernels need no argsort/gather.
+_ROUTER_SORTED_SOURCE = _ROUTER_SOURCE.rstrip() + """
+    if (lane == 0) {
+        uint ord[K];
+        for (uint k = 0; k < K; ++k) ord[k] = k;
+        for (int a = 1; a < int(K); ++a) {
+            uint v = ord[a];
+            int b = a - 1;
+            while (b >= 0 && chosen[ord[b]] > chosen[v]) { ord[b + 1] = ord[b]; --b; }
+            ord[b + 1] = v;
+        }
+        for (uint k = 0; k < K; ++k) {
+            order[row * K + k] = row * K + ord[k];
+            sorted_e[row * K + k] = chosen[ord[k]];
+        }
+    }
+"""
+_router_sorted_kernel = None
+
+
+def route_topk_sorted(logits, bias, top_k, route_scale):
+    """``route_topk`` for one row plus (order, sorted experts), both [K] uint32."""
+    global _router_sorted_kernel
+    rows, experts = logits.shape
+    if _router_sorted_kernel is None:
+        _router_sorted_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_route_topk_sorted",
+            input_names=["logits", "bias", "route_scale"],
+            output_names=["inds", "weights", "order", "sorted_e"],
+            source=_ROUTER_SORTED_SOURCE,
+        )
+    inds, weights, order, sorted_e = _router_sorted_kernel(
+        inputs=[logits.astype(mx.float32), bias.astype(mx.float32),
+                mx.array([route_scale], dtype=mx.float32)],
+        template=[("E", experts), ("K", top_k)],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(rows, top_k), (rows, top_k), (rows * top_k,), (rows * top_k,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32],
+    )
+    return inds, weights, order, sorted_e
+
+
+# Routed-expert activation in one kernel: the optional per-pair NVFP4 tensor
+# scale as a BF16 multiply (``y * s.astype(bf16)``), then the softcapped SwiGLU
+# of ``model._softcapped_swiglu`` on the interleaved gate/up columns, with MLX's
+# own functors (precise tanh, sigmoid via precise exp) in the same order.
+_SWIGLU_SOURCE = """
+#pragma METAL fp contract(off)
+    uint j = thread_position_in_grid.x;
+    uint p = thread_position_in_grid.y;
+    if (j >= I) return;
+    float g = static_cast<float>(y[(size_t)p * 2 * I + 2 * j]);
+    float u = static_cast<float>(y[(size_t)p * 2 * I + 2 * j + 1]);
+    if (HAS_S) {
+        float sv = gs[inds[p / SDIV]] * inv_den[0];
+        float sb = static_cast<float>(static_cast<bfloat16_t>(sv));
+        g = static_cast<float>(static_cast<T>(g * sb));
+        u = static_cast<float>(static_cast<T>(u * sb));
+    }
+    const float gc = caps[0], uc = caps[1];
+    float sg = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+    sg = (g < 0.0f) ? sg : 1.0f - sg;
+    float a = metal::precise::tanh(g / gc) * gc;
+    a = a * sg;
+    float b = metal::precise::tanh(u / uc) * uc;
+    out[(size_t)p * I + j] = static_cast<T>(a * b);
+"""
+_swiglu_kernel = None
+
+
+def scaled_swiglu(y, global_scale, inds, inv_den, caps, sdiv=1):
+    """``y`` [P, 2I] BF16 rows (row-contiguous); the scale of pair p is
+    ``global_scale[inds[p // sdiv]] * inv_den`` (``global_scale`` None: no
+    scale); ``caps`` [2] FP32 (gate, up). Returns [P, I] in y's dtype."""
+    global _swiglu_kernel
+    if _swiglu_kernel is None:
+        _swiglu_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_scaled_swiglu",
+            input_names=["y", "gs", "inds", "inv_den", "caps"],
+            output_names=["out"],
+            source=_SWIGLU_SOURCE,
+        )
+    p, two_i = y.shape
+    has_s = global_scale is not None
+    zero = mx.zeros((1,), mx.uint32)
+    (out,) = _swiglu_kernel(
+        inputs=[y, global_scale if has_s else mx.zeros((1,), mx.float32),
+                inds.reshape(-1).astype(mx.uint32) if has_s else zero,
+                mx.array([inv_den], dtype=mx.float32), caps],
+        template=[("T", y.dtype), ("I", two_i // 2), ("HAS_S", int(has_s)), ("SDIV", sdiv)],
+        grid=(two_i // 2, p, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(p, two_i // 2)],
+        output_dtypes=[y.dtype],
     )
     return out
