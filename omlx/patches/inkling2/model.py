@@ -522,6 +522,8 @@ _FUSED_DECODE_CONV = True
 _MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "") == "1"
 # Megakernel slice 2: single-token gated o_proj + attention conv + residual.
 _MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
+# Megakernel slice 6: sliding single-token projection epilogue in one kernel.
+_MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
 _MK_ROUTER = os.environ.get("OMLX_INKLING2_MK_ROUTER", "") == "1"
 _taps_stacked: dict = {}
@@ -721,6 +723,12 @@ class Inkling2Attention(nn.Module):
         relative bias [B, L, H, R], gate, sink and the next conv states."""
         b, length, _ = xq.shape
         dkv = self.dkv
+        if (
+            _MK_PREP and self.sliding and b == 1 and length == 1 and tau is None
+            and xq.dtype == mx.bfloat16 and ks.dtype == mx.float32 and vs.dtype == mx.float32
+            and self.rel_extent == self.window and self.head_dim == 128 and self.d_rel <= 32
+        ):
+            return self._mk_project(xq, xk, xv, ks, vs)
         if self.sliding:
             if xk is None:
                 q, k, v, r, gate, sink = mx.split(_proj(self.in_proj, xq), self._cuts, axis=-1)
@@ -797,7 +805,47 @@ class Inkling2Attention(nn.Module):
             vs,
         )
 
+    def _mk_project(self, xq, xk, xv, ks, vs):
+        """Single-token sliding projections + ``kernels.mk_prep``. Returns the
+        distance-reversed bias [1, H, 1, R] in place of ``rel``."""
+        c = self._cuts
+        if xk is None:
+            src = _proj(self.in_proj, xq)
+            rows = (0, 0, 0)
+        else:
+            src = self.in_proj(mx.concatenate([xq, xk, xv], axis=0))
+            rows = (0, 1, 2)
+        w = src.shape[-1]
+        offs = (rows[0] * w, rows[0] * w + c[2], rows[1] * w + c[0], rows[2] * w + c[1])
+        q, k, v, relrev, ks, vs = kernels.mk_prep(
+            src, offs, self.q_scale, self.r_scale,
+            mx.concatenate([self._qk_clip.reshape(1), self._r_clip.reshape(1)]),
+            _stacked(self._k_taps), _stacked(self._v_taps), ks, vs, self._sconv_scale,
+            self.k_conv.dtype, self.rel_proj.astype(src.dtype),
+            self.n_heads, self.n_kv, self.head_dim, self.d_rel,
+        )
+        qrow = src[0:1] if xk is not None else src
+        gate = qrow[..., c[3] : c[4]]
+        sink = qrow[..., c[4] :]
+        return q, k, v, relrev, gate, sink, ks, vs
+
     def attend(self, q, k, v, rel, sink, kv):
+        if (
+            rel.shape[1] == self.n_heads and rel.shape[1] != 1 and q.shape[2] == 1
+            and getattr(kv, "left_padding", None) is None
+        ):
+            # mk_prep's reversed bias: the decode mask is its last ``keys`` columns.
+            k, v = kv.update_and_fetch(k, v)
+            s = k.shape[2]
+            lo = max(0, s - self.window) if self.window else 0
+            if lo:
+                k = k[:, :, lo:]
+                v = v[:, :, lo:]
+            sv = s - lo
+            mask = rel[..., rel.shape[-1] - sv :]
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=mask, sinks=sink[0, 0].astype(q.dtype)
+            )
         if kv is not None:
             k, v = kv.update_and_fetch(k, v)
         left_padding = getattr(kv, "left_padding", None) if kv is not None else None
