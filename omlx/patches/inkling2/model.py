@@ -416,9 +416,10 @@ def _mix_messages(x, message, down, gain_forget, bf16_weights=None):
     """
     n, b, length, hidden = x.shape
     rows = b * length
-    if bf16_weights is not None and rows <= _COMPILED_MAX_TOKENS and _FUSED_MIX:
-        # Decode/verify rows: norms + rounding, down projection, and
-        # up projection + gating in three kernels (bit-identical).
+    if bf16_weights is not None and rows == 1 and _FUSED_MIX:
+        # Single-token decode: norms + rounding, down projection, and
+        # up projection + gating in three kernels (bit-identical; at verify
+        # widths the stock sequence measured faster).
         parts = kernels.loop_gemv(kernels.mix_z(x, message), bf16_weights[0])
         return kernels.loop_mix_up(parts, bf16_weights[1], x, message)
     # Like the reference, the down projection takes BF16-rounded inputs,
