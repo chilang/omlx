@@ -2198,3 +2198,43 @@ def mk_prep_full(qsrc, ksrc, vsrc, r0, tau, qscale, rscale, thr, ktaps, vtaps, k
         output_dtypes=[qsrc.dtype] * 4 + [mx.float32, mx.float32],
     )
     return tuple(outs)
+
+
+# Megakernel slice 10 (OMLX_INKLING2_MK_NORM3=1, with MK_PREP): a looped
+# visit's three attention-input norms + bf16 casts + stacking in one launch
+# (one threadgroup per row, ``rms_single_row`` order as ``_RAW_RMS_PROLOGUE``).
+_MK_NORM_ROWS_SOURCE = """
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint row = threadgroup_position_in_grid.x;
+    const device float* p = y;
+    const size_t base = (size_t)row * H;
+""" + _RAW_RMS_PROLOGUE + """
+    for (uint c = tid; c < H; c += TG)
+        xb[base + c] = static_cast<bfloat16_t>(nw[c] * (y[base + c] * inv));
+"""
+_mk_norm_rows_kernel = None
+
+
+def mk_norm_rows(y, norm_w):
+    """``rms_norm(y[i], w, 1e-6).astype(bf16)`` for every FP32 row of ``y``
+    [R, H], stacked [R, H]."""
+    global _mk_norm_rows_kernel
+    if _mk_norm_rows_kernel is None:
+        _mk_norm_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_norm_rows",
+            input_names=["y", "nw"],
+            output_names=["xb"],
+            source=_MK_NORM_ROWS_SOURCE,
+        )
+    rows, h = y.shape
+    (out,) = _mk_norm_rows_kernel(
+        inputs=[y, norm_w.astype(mx.float32)],
+        template=[("H", h), ("TG", 256)],
+        grid=(256 * rows, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, h)],
+        output_dtypes=[mx.bfloat16],
+    )
+    return out

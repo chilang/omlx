@@ -525,6 +525,8 @@ _MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
 # Megakernel slice 6: sliding single-token projection epilogue in one kernel.
 _MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "") == "1"
 _MK_PREP_FULL = os.environ.get("OMLX_INKLING2_MK_PREP_FULL", "1") != "0"
+# Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
+_MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
 _MK_ROUTER = os.environ.get("OMLX_INKLING2_MK_ROUTER", "") == "1"
 _taps_stacked: dict = {}
@@ -812,11 +814,13 @@ class Inkling2Attention(nn.Module):
             vs,
         )
 
-    def _mk_project(self, xq, xk, xv, ks, vs):
+    def _mk_project(self, xq, xk, xv, ks, vs, src=None):
         """Single-token sliding projections + ``kernels.mk_prep``. Returns the
         distance-reversed bias [1, H, 1, R] in place of ``rel``."""
         c = self._cuts
-        if xk is None:
+        if src is not None:
+            rows = (0, 1, 2)
+        elif xk is None:
             src = _proj(self.in_proj, xq)
             rows = (0, 0, 0)
         else:
@@ -831,7 +835,7 @@ class Inkling2Attention(nn.Module):
             self.k_conv.dtype, self.rel_proj.astype(src.dtype),
             self.n_heads, self.n_kv, self.head_dim, self.d_rel,
         )
-        qrow = src[0:1] if xk is not None else src
+        qrow = src[0:1] if rows != (0, 0, 0) else src
         gate = qrow[..., c[3] : c[4]]
         sink = qrow[..., c[4] :]
         return q, k, v, relrev, gate, sink, ks, vs
@@ -966,17 +970,30 @@ class Inkling2Layer(nn.Module):
                 xq = xk = xv = mixed[:, :, 0]
             else:
                 xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
+        mixed3 = None
         if messages is not None:
-            xq, xk, xv = _mix_messages(
+            mixed3 = _mix_messages(
                 mx.stack([xq, xk, xv]),
                 messages[:, :, :3].transpose(2, 0, 1, 3),
                 self.loop_down[:3],
                 self.loop_gain_forget[:3],
                 self.__dict__.get("_loop_bf16", (None, None))[0],
             )
+            xq, xk, xv = mixed3
         if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
             xk = xv = None
+        elif (
+            self.sliding and _MK_NORM3 and _MK_PREP and h.size == h.shape[-1] and mixed3 is not None
+            and xq.dtype == mx.float32 and dtype == mx.bfloat16 and self.attn_norm.eps == 1e-6
+            and ks.dtype == mx.float32 and vs.dtype == mx.float32 and tau is None
+            and isinstance(self.attn.in_proj, nn.QuantizedLinear)
+        ):
+            xs = kernels.mk_norm_rows(
+                mixed3.reshape(3, -1), self.attn_norm.weight
+            ).reshape(3, 1, -1)
+            src = self.attn.in_proj(xs)
+            return (*self.attn._mk_project(None, None, None, ks, vs, src=src), h_n)
         elif self.sliding:
             xq, xk, xv = (self.attn_norm(x).astype(dtype) for x in (xq, xk, xv))
         else:
