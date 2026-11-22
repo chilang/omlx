@@ -2739,3 +2739,57 @@ def affine4_gather_rows(x, w, scales, biases, group_size, order, sorted_e, src_d
         output_dtypes=[x.dtype],
     )
     return y
+
+
+# ---------------------------------------------------------------------------
+# NOT bit-exact (OMLX_INKLING2_MK_LOOP_FAST=1): the loop controllers' down
+# projection (``loop_gemv`` at N <= 128, one row) with K split into KS
+# contiguous slices per column (threadgroup = N x KS threads, coalesced row
+# reads), each slice summed with fma, slices combined by a tree. The sums are
+# reassociated relative to MLX's gemv_t order, so outputs can differ in the
+# last bits (measured by tools/mk_dev_audit.py).
+# ---------------------------------------------------------------------------
+_LOOP_GEMV_FAST_SOURCE = """
+    uint t = thread_position_in_threadgroup.x;
+    uint lc = t % CPT;
+    uint ks = t / CPT;
+    uint col = threadgroup_position_in_grid.y * CPT + lc;
+    uint bi = threadgroup_position_in_grid.x;
+    constexpr int SL = K / KS;
+    const device bfloat16_t* wp = w + (size_t)bi * K * N + (size_t)ks * SL * N + col;
+    auto zp = z + (size_t)bi * K + ks * SL;
+    float acc = 0.0f;
+    for (int k = 0; k < SL; ++k) acc = metal::fma(static_cast<float>(zp[k]), static_cast<float>(wp[(size_t)k * N]), acc);
+    threadgroup float red[KS][CPT];
+    red[ks][lc] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = KS / 2; s >= 1; s >>= 1) {
+        if (ks < s) red[ks][lc] = red[ks][lc] + red[ks + s][lc];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (ks == 0) out[(size_t)bi * N + col] = red[0][lc];
+"""
+_loop_gemv_fast_kernel = None
+MK_LOOP_FAST = int(_os.environ.get("OMLX_INKLING2_MK_LOOP_FAST", "0") == "1")
+MK_LOOP_KS = 128
+MK_LOOP_FCPT = 8
+_loop_gemv_exact = loop_gemv
+
+
+def loop_gemv(z, w):
+    global _loop_gemv_fast_kernel
+    b, rows, k = z.shape
+    n = w.shape[-1]
+    ks = MK_LOOP_KS
+    cpt = MK_LOOP_FCPT
+    if not (MK_LOOP_FAST and rows == 1 and n <= 128 and n % cpt == 0 and cpt * ks <= 1024 and k % ks == 0):
+        return _loop_gemv_exact(z, w)
+    if _loop_gemv_fast_kernel is None:
+        _loop_gemv_fast_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_loop_gemv_fast", input_names=["z", "w"], output_names=["out"],
+            source=_LOOP_GEMV_FAST_SOURCE)
+    (out,) = _loop_gemv_fast_kernel(
+        inputs=[z, w], template=[("K", k), ("N", n), ("KS", ks), ("CPT", cpt)],
+        grid=(cpt * ks * b, n // cpt, 1), threadgroup=(cpt * ks, 1, 1),
+        output_shapes=[(b, 1, n)], output_dtypes=[mx.float32])
+    return out
