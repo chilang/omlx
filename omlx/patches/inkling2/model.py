@@ -531,6 +531,8 @@ _MK_PREP_FULL = os.environ.get("OMLX_INKLING2_MK_PREP_FULL", "1") != "0"
 _MK_PREP_ROWS = os.environ.get("OMLX_INKLING2_MK_PREP_ROWS", "") == "1"
 # Megakernel slice 12: verify-width MoE tail (combine + MLP conv + residual) in one kernel.
 _MK_MOE_ROWS = os.environ.get("OMLX_INKLING2_MK_MOE_ROWS", "") == "1"
+# Megakernel slice 15: verify-width (2..4 rows) gated o_proj + attention conv + residual.
+_MK_OPROJ_ROWS = os.environ.get("OMLX_INKLING2_MK_OPROJ_ROWS", "") == "1"
 # Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
 _MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
@@ -1071,7 +1073,22 @@ class Inkling2Layer(nn.Module):
         )
 
     def _post(self, out, gate, h, mlp_blocks, s2, s3, messages=None):
-        if self._mk_oproj_ok(out, h, s2):
+        o = self.attn.o_proj
+        if (
+            _MK_OPROJ_ROWS and h.shape[0] == 1 and 2 <= h.shape[1] <= 4 and out.dtype == mx.bfloat16
+            and h.dtype == mx.bfloat16 and s2.dtype == mx.float32 and isinstance(o, nn.QuantizedLinear)
+            and getattr(o, "mode", "affine") == "affine" and o.bits == 8 and "bias" not in o
+            and o.scales.dtype == mx.bfloat16 and o.group_size % 8 == 0 and o.weight.shape[0] % 8 == 0
+            and mx.default_device() == mx.gpu and out.ndim == 4 and out.shape[2] == h.shape[1]
+        ):
+            b_, _, length_, _ = out.shape
+            xg = out.transpose(0, 2, 1, 3).reshape(b_, length_, -1)
+            xg = (xg.astype(mx.float32) * mx.sigmoid(gate.astype(mx.float32))).astype(gate.dtype)
+            residual, s2 = kernels.mk_oproj_rows(
+                xg, o.weight, o.scales, o.biases, o.group_size,
+                s2, _stacked(self._attn_taps), self._conv_scale, self.attn_conv.dtype, h, self.is_boundary,
+            )
+        elif self._mk_oproj_ok(out, h, s2):
             # One dispatch: gated o_proj + attention conv + residual.
             o = self.attn.o_proj
             residual, s2 = kernels.mk_oproj(

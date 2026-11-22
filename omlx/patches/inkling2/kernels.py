@@ -2437,3 +2437,103 @@ def mk_moe_tail_rows(z, weights, inds, gs, inv_den, residual, state, taps, cscal
         output_dtypes=[z.dtype, mx.float32],
     )
     return hout, win
+
+
+# ---------------------------------------------------------------------------
+# Megakernel slice 15 (OMLX_INKLING2_MK_OPROJ_ROWS=1): verify-width (2..4 rows)
+# gated o_proj + attention conv (window written for the rollback) + residual.
+# The GEMV is MLX 0.32.4's multi-row 8-bit ``qmv_wide_impl`` with k_lanes = 8
+# (matched bit for bit at M = 2..4, tools/mk_qmvwide_probe.py): each lane owns
+# groups g = k_lane, k_lane + 8, ...; 8-value sub-chunks dequantized as
+# s * q + b, per-vector sub-chunk sums added in order, a shuffle ladder.
+# x[l] = bf16(attn[0, h, l, d] * sigmoid(gate[l])) is formed on load.
+# ---------------------------------------------------------------------------
+_MK_OPROJ_ROWS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    constexpr int KL = 8;
+    constexpr int RPS = 32 / KL;
+    const int k_lane = simd_lid % KL;
+    const int sg_row = simd_lid / KL;
+    const int out_row = threadgroup_position_in_grid.y * (RPS * 2) + RPS * simd_gid + sg_row;
+    const int row = min(out_row, N - 1);
+    constexpr int KG = K / GS;
+    const device uint8_t* wrow = (const device uint8_t*)w + (size_t)row * K;
+    const device T* srow = scales + (size_t)row * KG;
+    const device T* brow = biases + (size_t)row * KG;
+    float result[L];
+    for (int v = 0; v < L; ++v) result[v] = 0.0f;
+    for (int g = k_lane; g < KG; g += KL) {
+        float s = static_cast<float>(srow[g]);
+        float b = static_cast<float>(brow[g]);
+        for (int sc = 0; sc < GS / 8; ++sc) {
+            const int k0 = g * GS + sc * 8;
+            float wd[8];
+            for (int i = 0; i < 8; ++i) {
+                float q = static_cast<float>(wrow[k0 + i]);
+                float t = s * q; wd[i] = t + b;
+            }
+            for (int v = 0; v < L; ++v) {
+                float acc = 0.0f;
+                for (int i = 0; i < 8; ++i) {
+                    float t = static_cast<float>(xg[(size_t)v * K + k0 + i]) * wd[i]; acc = acc + t;
+                }
+                result[v] = result[v] + acc;
+            }
+        }
+    }
+    for (int v = 0; v < L; ++v) {
+        result[v] += simd_shuffle_down(result[v], 4);
+        result[v] += simd_shuffle_down(result[v], 2);
+        result[v] += simd_shuffle_down(result[v], 1);
+    }
+    if (k_lane == 0 && out_row < N) {
+        uint c = out_row;
+        float win[KT - 1 + L];
+        for (int t = 0; t < KT - 1; ++t) win[t] = state[(size_t)t * N + c];
+        for (int v = 0; v < L; ++v) win[KT - 1 + v] = static_cast<float>(static_cast<T>(result[v]));
+        for (int t = 0; t < KT - 1 + L; ++t) window[(size_t)t * N + c] = win[t];
+        for (int v = 0; v < L; ++v) {
+            float o = taps[c] * win[v];
+            for (int t = 1; t < KT; ++t) {
+                float tt = taps[(size_t)t * N + c] * win[v + t];
+                o = o + tt;
+            }
+            float xf = win[v + KT - 1];
+            float y = (static_cast<float>(static_cast<W>(o)) + xf) * cscale[0];
+            T m = static_cast<T>(y);
+            residual[(size_t)v * N + c] = BOUND ? static_cast<float>(m)
+                : static_cast<float>(h[(size_t)v * N + c]) + static_cast<float>(m);
+        }
+    }
+"""
+_mk_oproj_rows_kernel = None
+
+
+def mk_oproj_rows(xg, w, scales, biases, group_size, state, taps, cscale, wdtype, h, boundary):
+    """xg [1, L, K] bf16 gated attention output (``Inkling2Attention.output``'s
+    input to o_proj), h [1, L, N]. Returns (residual [1, L, N] FP32, window
+    [1, KT-1+L, N] FP32)."""
+    global _mk_oproj_rows_kernel
+    if _mk_oproj_rows_kernel is None:
+        _mk_oproj_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mk_oproj_rows",
+            input_names=["xg", "w", "scales", "biases", "state", "taps", "cscale", "h"],
+            output_names=["residual", "window"],
+            source=_MK_OPROJ_ROWS_SOURCE,
+        )
+    _, length, k = xg.shape
+    n = w.shape[0]
+    kt = taps.shape[0]
+    residual, win = _mk_oproj_rows_kernel(
+        inputs=[xg, w, scales, biases, state, taps,
+                mx.array([cscale], dtype=mx.float32), h],
+        template=[("T", xg.dtype), ("W", wdtype), ("K", k), ("N", n), ("GS", group_size),
+                  ("L", length), ("KT", kt), ("BOUND", int(boundary))],
+        grid=(64, (n + 7) // 8, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(1, length, n), (1, kt - 1 + length, n)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    return residual, win
