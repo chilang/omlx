@@ -458,7 +458,7 @@ class Inkling2MoE(nn.Module):
             _MK_ROUTE_ROWS and 2 <= flat.shape[0] <= _GROUPED_MAX_ROWS and ex.w13.mode == "nvfp4"
             and ex.w2.mode == "nvfp4" and mx.default_device() == mx.gpu and self.router_weight.shape[0] % 32 == 0
         ):
-            logits = flat.astype(mx.float32) @ self.router_weight.T
+            logits = _router_logits_rows(flat, self.router_weight)
             inds, w, order, sorted_e = kernels.route_topk_sorted_rows(
                 logits, self.router_bias, self.top_k, self.route_scale)
             return ex._grouped_nvfp4(flat, inds, w, order, sorted_e).reshape(shape)
@@ -569,6 +569,16 @@ _MK_OPROJ_ROWS = os.environ.get("OMLX_INKLING2_MK_OPROJ_ROWS", "") == "1"
 _MK_ROUTE_ROWS = os.environ.get("OMLX_INKLING2_MK_ROUTE_ROWS", "") == "1"
 # Megakernel slice 19: affine 4-bit expert layers, each distinct expert read once (1..8 rows).
 _MK_AFFINE = os.environ.get("OMLX_INKLING2_MK_AFFINE", "") == "1"
+# NOT bit-exact vs the incumbent (equal to the 1-row decode path per row): verify router logits as R
+# independent 1-row GEMVs instead of MLX's multi-row matmul (OMLX_INKLING2_MK_ROUTER_PERROW=1).
+_MK_ROUTER_PERROW = os.environ.get("OMLX_INKLING2_MK_ROUTER_PERROW", "") == "1"
+
+
+def _router_logits_rows(flat, w):
+    xf = flat.astype(mx.float32)
+    if _MK_ROUTER_PERROW and xf.shape[0] > 1:
+        return mx.concatenate([xf[i : i + 1] @ w.T for i in range(xf.shape[0])], axis=0)
+    return xf @ w.T
 # Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
 _MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
@@ -1170,7 +1180,7 @@ class Inkling2Layer(nn.Module):
         ):
             flat = x_mlp.reshape(-1, x_mlp.shape[-1])
             if _MK_ROUTE_ROWS:
-                lg = flat.astype(mx.float32) @ self.mlp.router_weight.T
+                lg = _router_logits_rows(flat, self.mlp.router_weight)
                 inds, w, order, sorted_e = kernels.route_topk_sorted_rows(
                     lg, self.mlp.router_bias, self.mlp.top_k, self.mlp.route_scale)
                 z = ex._grouped_nvfp4(flat, inds, w, order, sorted_e, return_z=True)
