@@ -140,7 +140,9 @@ def _unit_rms(x: mx.array, eps: float = 1e-6) -> mx.array:
 
 
 def _small_rows(x: mx.array) -> bool:
-    return x.ndim == 3 and x.shape[0] * x.shape[1] <= _COMPILED_MAX_TOKENS
+    # Single-token decode only: at verify widths the stock norm + cast ran
+    # faster (r4 +0.3 ms in step_bench).
+    return x.ndim == 3 and x.shape[0] * x.shape[1] == 1
 
 
 def _unit_rms_of(x: mx.array) -> mx.array:
