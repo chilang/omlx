@@ -1967,3 +1967,521 @@ def dynamic_conv(
         output_dtypes=[out_dtype, mx.float32],
     )
     return out, xp
+
+
+# ---------------------------------------------------------------------------
+# Routed experts at decode and verify widths (bf16 activations). Per pair the
+# arithmetic is MLX 0.32.4's ``gather_qmm`` at M = 1 (``fp_qmv`` for NVFP4,
+# ``qmv`` for affine 4-bit): 8 values per lane, 256-value blocks, the group
+# scale per lane block, ``simd_sum``; ``fp contract(off)`` keeps MLX's
+# separate multiplies and adds. So each output equals the stock path's bit for
+# bit, and a verify row equals its serial decode step. What changes is the
+# memory traffic: an expert picked by several rows is read once, and at one
+# token the SwiGLU, expert sum, MLP conv and residual add run in the matmul
+# kernels instead of their own launches.
+# ---------------------------------------------------------------------------
+_NVFP4_HEADER = """
+inline float fp4v(ushort b) {
+    half c = as_type<half>(ushort((b & 7) << 9));
+    c *= 16384.0h;
+    return float((b & 8) ? -c : c);
+}
+"""
+
+_NVFP4_ROWS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint p = threadgroup_position_in_grid.y;
+    uint e = sorted_e[p];
+    if (p > 0 && sorted_e[p - 1] == e) {
+        return;
+    }
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int cnt = 1;
+    while (cnt < MAXR && p + cnt < P && sorted_e[p + cnt] == e) {
+        cnt++;
+    }
+    constexpr int KW = K / 8;
+    constexpr int KG = K / 16;
+    int out_row = threadgroup_position_in_grid.x * 8 + simd_gid * 4;
+    const device uint8_t* ws =
+        (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
+    const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    if (SINGLE && cnt == 1) {
+        // One pair for this expert: the general body's per-pair arithmetic
+        // without the MAXR-wide bookkeeping.
+        uint pair = order[p];
+        const device T* x1 = x + (size_t)(pair / SRC_DIV) * K + lane * 8;
+        float res1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < K; k += 256) {
+            if (k + (int)lane * 8 < K) {
+                float s[4];
+                float wd[4][8];
+                for (int r = 0; r < 4; ++r) {
+                    const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                    for (int i = 0; i < 2; ++i) {
+                        ushort q = w16[i];
+                        wd[r][4 * i] = fp4v(q);
+                        wd[r][4 * i + 1] = fp4v(q >> 4);
+                        wd[r][4 * i + 2] = fp4v(q >> 8);
+                        wd[r][4 * i + 3] = fp4v(q >> 12);
+                    }
+                    uchar sb = sc[r * KG];
+                    ushort v = sb & 127;
+                    ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                    s[r] = float(as_type<half>(u) * 256.0h);
+                }
+                float xt[8];
+                for (int i = 0; i < 8; ++i) {
+                    xt[i] = float(x1[k + i]);
+                }
+                for (int r = 0; r < 4; ++r) {
+                    float accum = 0.0f;
+                    for (int i = 0; i < 2; ++i) {
+                        accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                                  xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
+                    }
+                    res1[r] += s[r] * accum;
+                }
+            }
+            ws += 128;
+            sc += 16;
+        }
+        for (int r = 0; r < 4; ++r) {
+            float v = simd_sum(res1[r]);
+            if (lane == 0) {
+                y[(size_t)pair * N + out_row + r] = static_cast<T>(v);
+            }
+        }
+        return;
+    }
+    uint dst[MAXR];
+    const device T* xs[MAXR];
+    for (int j = 0; j < MAXR; ++j) {
+        uint pair = order[p + min(j, cnt - 1)];
+        dst[j] = pair;
+        xs[j] = x + (size_t)(pair / SRC_DIV) * K + lane * 8;
+    }
+    float result[MAXR][4];
+    for (int j = 0; j < MAXR; ++j) {
+        for (int r = 0; r < 4; ++r) {
+            result[j][r] = 0.0f;
+        }
+    }
+    for (int k = 0; k < K; k += 256) {
+        if (k + (int)lane * 8 < K) {
+            float s[4];
+            float wd[4][8];
+            for (int r = 0; r < 4; ++r) {
+                const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                for (int i = 0; i < 2; ++i) {
+                    ushort q = w16[i];
+                    wd[r][4 * i] = fp4v(q);
+                    wd[r][4 * i + 1] = fp4v(q >> 4);
+                    wd[r][4 * i + 2] = fp4v(q >> 8);
+                    wd[r][4 * i + 3] = fp4v(q >> 12);
+                }
+                uchar sb = sc[r * KG];
+                ushort v = sb & 127;
+                ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                s[r] = float(as_type<half>(u) * 256.0h);
+            }
+            for (int j = 0; j < MAXR; ++j) {
+                if (j < cnt) {
+                    float xt[8];
+                    for (int i = 0; i < 8; ++i) {
+                        xt[i] = float(xs[j][k + i]);
+                    }
+                    for (int r = 0; r < 4; ++r) {
+                        float accum = 0.0f;
+                        for (int i = 0; i < 2; ++i) {
+                            accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                                      xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
+                        }
+                        result[j][r] += s[r] * accum;
+                    }
+                }
+            }
+        }
+        ws += 128;
+        sc += 16;
+    }
+    for (int j = 0; j < MAXR; ++j) {
+        if (j < cnt) {
+            for (int r = 0; r < 4; ++r) {
+                float v = simd_sum(result[j][r]);
+                if (lane == 0) {
+                    y[(size_t)dst[j] * N + out_row + r] = static_cast<T>(v);
+                }
+            }
+        }
+    }
+"""
+_nvfp4_rows_kernel = None
+
+
+def nvfp4_gather_rows(x, w, scales, order, sorted_e, src_div: int, max_rows: int):
+    """``y[pair] = x[pair // src_div] @ W[expert(pair)]^T`` for NVFP4 experts,
+    each distinct expert's weights read once for all of its pairs.
+
+    ``x``: [Q, K]; ``w``/``scales``: [E, N, K/8] uint32 codes and [E, N, K/16]
+    E4M3 scales; ``order``/``sorted_e``: the pairs in expert order (``argsort``
+    of the flat routing) and their experts; ``max_rows`` bounds the pairs per
+    expert. Returns [P, N] in ``x.dtype``, before the NVFP4 tensor scale (as
+    ``gather_qmm``)."""
+    global _nvfp4_rows_kernel
+    if _nvfp4_rows_kernel is None:
+        _nvfp4_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_nvfp4_gather_rows",
+            input_names=["x", "w", "scales", "sorted_e", "order"],
+            output_names=["y"],
+            header=_NVFP4_HEADER,
+            source=_NVFP4_ROWS_SOURCE,
+        )
+    pairs = order.shape[0]
+    n = w.shape[1]
+    k = x.shape[-1]
+    (y,) = _nvfp4_rows_kernel(
+        inputs=[x, w, scales, sorted_e, order],
+        template=[("T", x.dtype), ("K", k), ("N", n), ("P", pairs), ("MAXR", max_rows),
+                  ("SRC_DIV", src_div), ("SINGLE", 1)],
+        grid=(64 * (n // 8), pairs, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x.dtype],
+    )
+    return y
+
+
+_AFF4_DOT = """
+        float result[RPS];
+        for (int r = 0; r < RPS; ++r) result[r] = 0.0f;
+        for (int k = 0; k < KD; k += 256) {
+            if (k + (int)lane * 8 < KD) {
+                float xt[8]; float sum = 0.0f;
+                for (int i = 0; i < 8; i += 4) {
+                    float a0 = float(xs[k + i]), a1 = float(xs[k + i + 1]), a2 = float(xs[k + i + 2]), a3 = float(xs[k + i + 3]);
+                    float q = ((a0 + a1) + a2) + a3;
+                    sum = sum + q;
+                    xt[i] = a0; xt[i + 1] = a1 / 16.0f; xt[i + 2] = a2 / 256.0f; xt[i + 3] = a3 / 4096.0f;
+                }
+                for (int r = 0; r < RPS; ++r) {
+                    const device ushort* w16 = (const device ushort*)(wsb + (size_t)r * KB + k / 2);
+                    float accum = 0.0f;
+                    for (int i = 0; i < 2; ++i) {
+                        ushort q = w16[i];
+                        float t = ((xt[4*i] * float(q & 0x000f) + xt[4*i+1] * float(q & 0x00f0)) + xt[4*i+2] * float(q & 0x0f00)) + xt[4*i+3] * float(q & 0xf000);
+                        accum = accum + t;
+                    }
+                    float s = float(slb[(size_t)r * KG + k / GS]), b = float(blb[(size_t)r * KG + k / GS]);
+                    result[r] += metal::fma(s, accum, sum * b);
+                }
+            }
+        }
+        T z[RPS];
+        for (int r = 0; r < RPS; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
+"""
+_AFF4_ROWS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint p = threadgroup_position_in_grid.y;
+    uint e = sorted_e[p];
+    if (p > 0 && sorted_e[p - 1] == e) return;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int cnt = 1;
+    while (cnt < MAXR && p + cnt < P && sorted_e[p + cnt] == e) cnt++;
+    constexpr int RPS = 4;
+    constexpr int KD = K;
+    constexpr int KB = K / 2;
+    constexpr int KG = K / GS;
+    int out_row = threadgroup_position_in_grid.x * 8 + simd_gid * 4;
+    const device uint8_t* wsb = (const device uint8_t*)w + ((size_t)e * N + out_row) * KB + lane * 4;
+    const device T* slb = scales + ((size_t)e * N + out_row) * KG + lane / (GS / 8);
+    const device T* blb = biases + ((size_t)e * N + out_row) * KG + lane / (GS / 8);
+    for (int j = 0; j < cnt; ++j) {
+        uint pair = order[p + j];
+        const device T* xs = x + (size_t)(pair / SRC_DIV) * K + lane * 8;
+""" + _AFF4_DOT + """
+        if (lane == 0)
+            for (int r = 0; r < RPS; ++r) y[(size_t)pair * N + out_row + r] = z[r];
+    }
+"""
+_aff4_rows_kernel = None
+
+
+def affine4_gather_rows(x, w, scales, biases, group_size, order, sorted_e, src_div, max_rows):
+    """``nvfp4_gather_rows`` for affine 4-bit experts (``qmv`` arithmetic)."""
+    global _aff4_rows_kernel
+    if _aff4_rows_kernel is None:
+        _aff4_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_aff4_gather_rows",
+            input_names=["x", "w", "scales", "biases", "sorted_e", "order"],
+            output_names=["y"],
+            source=_AFF4_ROWS_SOURCE,
+        )
+    pairs = order.shape[0]
+    n = w.shape[1]
+    k = x.shape[-1]
+    (y,) = _aff4_rows_kernel(
+        inputs=[x, w, scales, biases, sorted_e, order],
+        template=[("T", x.dtype), ("K", k), ("N", n), ("GS", group_size), ("P", pairs),
+                  ("MAXR", max_rows), ("SRC_DIV", src_div)],
+        grid=(64 * (n // 8), pairs, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x.dtype],
+    )
+    return y
+
+
+_NVFP4_DOT_BODY = """
+    // MLX fp_qmv traversal for NVFP4 of 4 rows (``_NVFP4_ROWS_SOURCE``, one pair).
+    float result[RPS];
+    for (int r = 0; r < RPS; ++r) result[r] = 0.0f;
+    for (int k = 0; k < KD; k += 256) {
+        if (k + (int)lane * 8 < KD) {
+            float s[RPS];
+            float wd[RPS][8];
+            for (int r = 0; r < RPS; ++r) {
+                const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                for (int i = 0; i < 2; ++i) {
+                    ushort q = w16[i];
+                    wd[r][4 * i] = fp4v(q);
+                    wd[r][4 * i + 1] = fp4v(q >> 4);
+                    wd[r][4 * i + 2] = fp4v(q >> 8);
+                    wd[r][4 * i + 3] = fp4v(q >> 12);
+                }
+                uchar sb = sc[r * KG];
+                ushort v = sb & 127;
+                ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                s[r] = float(as_type<half>(u) * 256.0h);
+            }
+            float xt[8];
+            for (int i = 0; i < 8; ++i) {
+                xt[i] = float(xs[k + i]);
+            }
+            for (int r = 0; r < RPS; ++r) {
+                float accum = 0.0f;
+                for (int i = 0; i < 2; ++i) {
+                    accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                              xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
+                }
+                result[r] += s[r] * accum;
+            }
+        }
+        ws += 128;
+        sc += 16;
+    }
+    T z[RPS];
+    for (int r = 0; r < RPS; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
+"""
+# grid (64 * (2I / 4), TOP), threadgroup 64: simdgroup g of threadgroup x owns
+# w13 rows x*4 + g*2, +1 = (gate, up) of intermediate column x*2 + g; the
+# tensor scale and the softcapped SwiGLU follow in the lanes that hold them,
+# in ``_softcapped_swiglu``'s order and precision.
+_EXPERT_UPS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint p = threadgroup_position_in_grid.y;
+    uint e = inds[p];
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    constexpr int KD = H;
+    constexpr int N = 2 * I;
+    constexpr int KW = KD / 8;
+    constexpr int KG = KD / 16;
+    int out_row = threadgroup_position_in_grid.x * (2 * RPS) + simd_gid * RPS;
+    const device uint8_t* ws =
+        (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
+    const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    const device T* xs = x + lane * 8;
+    // MLX fp_qmv traversal for NVFP4 of 4 rows (``_NVFP4_ROWS_SOURCE``, one pair).
+    float result[RPS];
+    for (int r = 0; r < RPS; ++r) result[r] = 0.0f;
+    for (int k = 0; k < KD; k += 256) {
+        if (k + (int)lane * 8 < KD) {
+            float s[RPS];
+            float wd[RPS][8];
+            for (int r = 0; r < RPS; ++r) {
+                const device ushort* w16 = (const device ushort*)(ws + r * KW * 4);
+                for (int i = 0; i < 2; ++i) {
+                    ushort q = w16[i];
+                    wd[r][4 * i] = fp4v(q);
+                    wd[r][4 * i + 1] = fp4v(q >> 4);
+                    wd[r][4 * i + 2] = fp4v(q >> 8);
+                    wd[r][4 * i + 3] = fp4v(q >> 12);
+                }
+                uchar sb = sc[r * KG];
+                ushort v = sb & 127;
+                ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (((ushort)((sb >> 7) & 1)) << 15);
+                s[r] = float(as_type<half>(u) * 256.0h);
+            }
+            float xt[8];
+            for (int i = 0; i < 8; ++i) {
+                xt[i] = float(xs[k + i]);
+            }
+            for (int r = 0; r < RPS; ++r) {
+                float accum = 0.0f;
+                for (int i = 0; i < 2; ++i) {
+                    accum += (xt[4 * i] * wd[r][4 * i] + xt[4 * i + 1] * wd[r][4 * i + 1] +
+                              xt[4 * i + 2] * wd[r][4 * i + 2] + xt[4 * i + 3] * wd[r][4 * i + 3]);
+                }
+                result[r] += s[r] * accum;
+            }
+        }
+        ws += 128;
+        sc += 16;
+    }
+    T z[RPS];
+    for (int r = 0; r < RPS; ++r) z[r] = static_cast<T>(simd_sum(result[r]));
+    if (lane < RPS / 2) {
+        float g = static_cast<float>(z[2 * lane]);
+        float u = static_cast<float>(z[2 * lane + 1]);
+        float sv = gs[e] * inv_den[0];
+        float sb = static_cast<float>(static_cast<bfloat16_t>(sv));
+        g = static_cast<float>(static_cast<T>(g * sb));
+        u = static_cast<float>(static_cast<T>(u * sb));
+        const float gc = caps[0], uc = caps[1];
+        float sg = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+        sg = (g < 0.0f) ? sg : 1.0f - sg;
+        float a = metal::precise::tanh(g / gc) * gc;
+        a = a * sg;
+        float b = metal::precise::tanh(u / uc) * uc;
+        act[(size_t)p * I + out_row / 2 + lane] = static_cast<T>(a * b);
+    }
+"""
+# grid (32 * TOP, H / 2), threadgroup 32 * TOP: simdgroup j = pick j, output
+# columns y*2, +1; then two lanes of simdgroup 0 take the weighted sum in
+# ``moe_short_conv``'s order, the MLP conv window, the conv and the residual
+# add for their column, as ``_SHORT_CONV_MOE_SOURCE`` at L = 1.
+_EXPERT_DOWNS_SOURCE = """
+#pragma METAL fp contract(off)
+    uint j = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint e = inds[j];
+    constexpr int KD = I;
+    constexpr int N = H;
+    constexpr int KW = KD / 8;
+    constexpr int KG = KD / 16;
+    int out_row = threadgroup_position_in_grid.y * RPS;
+    const device uint8_t* ws =
+        (const device uint8_t*)(w + ((size_t)e * N + out_row) * KW) + lane * 4;
+    const device uint8_t* sc = scales + ((size_t)e * N + out_row) * KG + lane / 2;
+    const device T* xs = act + (size_t)j * I + lane * 8;
+""" + _NVFP4_DOT_BODY + """
+    threadgroup float tz[TOP][RPS];
+    if (lane == 0) {
+        for (int r = 0; r < RPS; ++r) tz[j][r] = static_cast<float>(z[r]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (j == 0 && lane < RPS) {
+        const uint c = out_row + lane;
+        float acc = 0.0f;
+        for (int t = 0; t < TOP; ++t) {
+            const float wt = wts[t] * (gs[inds[t]] * inv_den[0]);
+            const float prod = tz[t][lane] * wt;
+            const float term = prod + 0.0f;
+            acc = t == 0 ? term : term + acc;
+        }
+        const float own = static_cast<float>(static_cast<T>(acc));
+        float win[KT];
+        for (int i = 0; i < KT - 1; ++i) win[i] = static_cast<float>(state[(size_t)i * H + c]);
+        win[KT - 1] = own;
+        for (int i = 0; i < KT; ++i) xp[(size_t)i * H + c] = win[i];
+        float a = static_cast<float>(cw[(size_t)c * KT]) * win[0];
+        for (int i = 1; i < KT; ++i) {
+            const float tap = static_cast<float>(cw[(size_t)c * KT + i]);
+            const float term = tap * win[i];
+            a = a + term;
+        }
+        const float conv = static_cast<float>(static_cast<W>(a));
+        const float res = conv + own;
+        const float o = res * cscale[0];
+        float v = static_cast<float>(static_cast<T>(o));
+        v = static_cast<float>(residual[c]) + v;
+        hout[c] = static_cast<T>(v);
+    }
+"""
+_expert_ups_kernel = None
+_expert_downs_kernel = None
+
+
+def _expert_kernels():
+    global _expert_ups_kernel, _expert_downs_kernel
+    if _expert_ups_kernel is None:
+        _expert_ups_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_expert_ups",
+            input_names=["x", "w", "scales", "inds", "gs", "inv_den", "caps"],
+            output_names=["act"],
+            header=_NVFP4_HEADER,
+            source=_EXPERT_UPS_SOURCE,
+        )
+        _expert_downs_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_expert_downs_conv",
+            input_names=["act", "w", "scales", "inds", "wts", "gs", "inv_den",
+                         "residual", "state", "cw", "cscale"],
+            output_names=["hout", "xp"],
+            header=_NVFP4_HEADER,
+            source=_EXPERT_DOWNS_SOURCE,
+        )
+    return _expert_ups_kernel, _expert_downs_kernel
+
+
+def nvfp4_expert_decode(x, w13, w2, inds, weights, inv_den, caps, conv_w, state, scale, residual):
+    """One token's routed NVFP4 experts and MLP conv: ``moe_short_conv`` of the
+    expert outputs, in two kernels. ``x`` [1, H] bf16; ``w13``/``w2``: the
+    ``ExpertProj`` carriers; ``inds``/``weights`` [1, TOP] from ``route_topk``;
+    ``caps`` [2] FP32 (gate, up softcaps); ``conv_w`` [H, K]; ``state``
+    [1, K-1, H] FP32; ``residual`` [1, 1, H] FP32. Returns (h [1, 1, H] in
+    ``x.dtype``, the FP32 window [1, K, H]), or None when unsupported."""
+    top = inds.size
+    hidden = x.shape[-1]
+    n2 = w13.weight.shape[1]
+    kt = conv_w.shape[-1]
+    if (
+        mx.default_device() != mx.gpu
+        or top > 8
+        or hidden % 256
+        or n2 % 4
+        or not _fits_threadgroup(("expert_downs", top), lambda: _tiny_downs(top))
+    ):
+        return None
+    ups, downs = _expert_kernels()
+    inv = mx.array([inv_den], dtype=mx.float32)
+    flat_inds = inds.reshape(-1)
+    (act,) = ups(
+        inputs=[x, w13.weight, w13.scales, flat_inds, w13.global_scale, inv, caps],
+        template=[("T", x.dtype), ("H", hidden), ("I", n2 // 2), ("RPS", 2)],
+        grid=(64 * (n2 // 4), top, 1),
+        threadgroup=(64, 1, 1),
+        output_shapes=[(top, n2 // 2)],
+        output_dtypes=[x.dtype],
+    )
+    return downs(
+        inputs=[act, w2.weight, w2.scales, flat_inds, weights.reshape(-1), w2.global_scale, inv,
+                residual.reshape(-1), mx.contiguous(state), mx.contiguous(conv_w),
+                mx.array([scale], dtype=mx.float32)],
+        template=[("T", x.dtype), ("W", conv_w.dtype), ("H", hidden), ("I", n2 // 2),
+                  ("TOP", top), ("KT", kt), ("RPS", 2)],
+        grid=(32 * top, hidden // 2, 1),
+        threadgroup=(32 * top, 1, 1),
+        output_shapes=[(1, 1, hidden), (1, kt, hidden)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+
+
+def _tiny_downs(top):
+    """A one-column launch of the downs kernel at ``top`` picks (threadgroup probe)."""
+    _, downs = _expert_kernels()
+    i = 256
+    return downs(
+        inputs=[mx.zeros((top, i), mx.bfloat16), mx.zeros((top, 2, i // 8), mx.uint32),
+                mx.zeros((top, 2, i // 16), mx.uint8), mx.arange(top, dtype=mx.uint32),
+                mx.zeros((top,), mx.float32), mx.ones((top,), mx.float32), mx.ones((1,), mx.float32),
+                mx.zeros((2,), mx.float32), mx.zeros((3, 2), mx.float32), mx.zeros((2, 4), mx.float32),
+                mx.ones((1,), mx.float32)],
+        template=[("T", mx.bfloat16), ("W", mx.float32), ("H", 2), ("I", i), ("TOP", top), ("KT", 4), ("RPS", 2)],
+        grid=(32 * top, 1, 1),
+        threadgroup=(32 * top, 1, 1),
+        output_shapes=[(1, 1, 2), (1, 4, 2)],
+        output_dtypes=[mx.bfloat16, mx.float32],
+    )[0]

@@ -387,6 +387,9 @@ class Inkling2Experts(nn.Module):
         self.w2 = ExpertProj(e, h, i, w2_spec)
         self._gcap = mx.array(args.mlp_gate_softcap, dtype=mx.float32)
         self._ucap = mx.array(args.mlp_up_softcap, dtype=mx.float32)
+        self._caps = mx.array(
+            [args.mlp_gate_softcap, args.mlp_up_softcap], dtype=mx.float32
+        )
 
     def __call__(self, x: mx.array, inds: mx.array, weights: mx.array) -> mx.array:
         """FP32 sum of the routed expert outputs; the caller rounds it to the
@@ -400,6 +403,10 @@ class Inkling2Experts(nn.Module):
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
         do_sort = inds.size >= 64 and not is_row_exact_armed()
+        if not do_sort and inds.shape[0] <= _GROUPED_MAX_ROWS:
+            grouped = self._grouped(x, inds, weights)
+            if grouped is not None:
+                return grouped
         idx = inds
         inv = None
         if do_sort:
@@ -419,6 +426,56 @@ class Inkling2Experts(nn.Module):
         if s2 is not None:
             weights = weights * s2
         return z, weights
+
+
+    def _grouped(self, x, inds, weights):
+        """``unreduced`` for a few unsorted rows with each distinct expert's
+        weights read once for all the rows routed to it; per pair the same
+        arithmetic as ``gather_qmm``, so the outputs are the stock bits."""
+        w13, w2 = self.w13, self.w2
+        if mx.default_device() != mx.gpu or x.dtype != mx.bfloat16:
+            return None
+        if w13.mode == w2.mode == "nvfp4":
+
+            def gather(v, proj, src):
+                return kernels.nvfp4_gather_rows(
+                    v, proj.weight, proj.scales, order, sorted_e, src, rows
+                )
+
+        elif (
+            w13.mode == w2.mode == "affine"
+            and w13.bits == w2.bits == 4
+            and w13.scales.dtype == w2.scales.dtype == mx.bfloat16
+        ):
+
+            def gather(v, proj, src):
+                return kernels.affine4_gather_rows(
+                    v, proj.weight, proj.scales, proj.biases, proj.group_size,
+                    order, sorted_e, src, rows,
+                )
+
+        else:
+            return None
+        rows, top = inds.shape
+        flat = inds.reshape(-1)
+        order = mx.argsort(flat).astype(mx.uint32)
+        sorted_e = flat[order]
+        y = gather(x, w13, top).reshape(rows, top, 1, -1)
+        s13 = w13.post_scale(inds, y.dtype)
+        if s13 is not None:
+            s13 = s13[..., None, None].astype(y.dtype)
+        act = _softcapped_swiglu(
+            y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
+        )
+        z = gather(act.reshape(rows * top, -1), w2, 1).reshape(rows, top, -1)
+        s2 = w2.post_scale(inds, act.dtype)
+        if s2 is not None:
+            weights = weights * s2
+        return z, weights
+
+
+# Rows up to which the routed experts take ``Inkling2Experts._grouped``.
+_GROUPED_MAX_ROWS = 8
 
 
 def moe_sum(z: mx.array, weights: mx.array) -> mx.array:
@@ -459,6 +516,27 @@ class Inkling2MoE(nn.Module):
         inds, w = self.route(flat, x32)
         z, w = self.experts.unreduced(flat, inds, w)
         return z.reshape(*shape[:-1], *z.shape[-2:]), w.reshape(*shape[:-1], -1)
+
+    def decode_conv(self, x, x32, conv_w, state, scale, residual):
+        """One token: ``moe_short_conv`` of ``unreduced(x, x32)`` with the
+        NVFP4 experts, sum, conv and residual add in two kernels; None when
+        unsupported."""
+        ex = self.experts
+        if (
+            x.size != x.shape[-1]
+            or x.dtype != mx.bfloat16
+            or ex.w13.mode != "nvfp4"
+            or ex.w2.mode != "nvfp4"
+            or state.dtype != mx.float32
+            or residual.dtype != mx.float32
+        ):
+            return None
+        flat = x.reshape(1, -1)
+        inds, w = self.route(flat, None if x32 is None else x32.reshape(1, -1))
+        return kernels.nvfp4_expert_decode(
+            flat, ex.w13, ex.w2, inds, w, 1.0 / _NVFP4_DENOMINATOR, ex._caps,
+            conv_w, state, scale, residual,
+        )
 
 
 class AttnResQuery(nn.Module):
@@ -934,6 +1012,12 @@ class Inkling2Layer(nn.Module):
                         self.loop_gain_forget[3:],
                     ).squeeze(0)
                 x, x32 = _norm(self.mlp_norm, y).astype(h.dtype), None
+        conv = self.mlp.decode_conv(
+            x, x32, self.mlp_conv, s3, self._conv_scale, residual
+        )
+        if conv is not None:
+            h, s3 = conv
+            return h, s2, s3
         z, zw = self.mlp.unreduced(x, x32)
         conv = kernels.moe_short_conv(
             z, zw, self.mlp_conv, s3, self._conv_scale, residual, h.dtype
