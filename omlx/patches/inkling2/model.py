@@ -553,23 +553,29 @@ _FUSED_PREFILL_GLUE = True
 # dispatch). Verify widths (2..16 rows) keep the ops: rollback needs the window.
 _FUSED_DECODE_CONV = True
 # Megakernel slice 1: single-token MoE tail as ups + downs kernels (default off).
-_MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "") == "1"
+_MK_MOE = os.environ.get("OMLX_INKLING2_MK_MOE", "1") != "0"
 # Megakernel slice 2: single-token gated o_proj + attention conv + residual.
-_MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "") == "1"
+_MK_OPROJ = os.environ.get("OMLX_INKLING2_MK_OPROJ", "1") != "0"
 # Megakernel slice 6: sliding single-token projection epilogue in one kernel.
-_MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "") == "1"
+_MK_PREP = os.environ.get("OMLX_INKLING2_MK_PREP", "1") != "0"
 _MK_PREP_FULL = os.environ.get("OMLX_INKLING2_MK_PREP_FULL", "1") != "0"
 # Megakernel slice 11: sliding prep at verify widths (2..16 rows).
-_MK_PREP_ROWS = os.environ.get("OMLX_INKLING2_MK_PREP_ROWS", "") == "1"
+_MK_PREP_ROWS = os.environ.get("OMLX_INKLING2_MK_PREP_ROWS", "1") != "0"
 # Megakernel slice 12: verify-width MoE tail (combine + MLP conv + residual) in one kernel.
-_MK_MOE_ROWS = os.environ.get("OMLX_INKLING2_MK_MOE_ROWS", "") == "1"
+_MK_MOE_ROWS = os.environ.get("OMLX_INKLING2_MK_MOE_ROWS", "1") != "0"
 # Megakernel slice 15: verify-width (2..4 rows) gated o_proj + attention conv + residual.
-_MK_OPROJ_ROWS = os.environ.get("OMLX_INKLING2_MK_OPROJ_ROWS", "") == "1"
+_MK_OPROJ_ROWS = os.environ.get("OMLX_INKLING2_MK_OPROJ_ROWS", "1") != "0"
 # Megakernel slice 17: verify-width routing + pair order in one kernel.
-_MK_ROUTE_ROWS = os.environ.get("OMLX_INKLING2_MK_ROUTE_ROWS", "") == "1"
+_MK_ROUTE_ROWS = os.environ.get("OMLX_INKLING2_MK_ROUTE_ROWS", "1") != "0"
 # Megakernel slice 19: affine 4-bit expert layers, each distinct expert read once (1..8 rows).
-_MK_AFFINE = os.environ.get("OMLX_INKLING2_MK_AFFINE", "") == "1"
-_MK_ACTIVE = sorted(k for k, v in os.environ.items() if k.startswith("OMLX_INKLING2_MK_") and v not in ("", "0"))
+_MK_AFFINE = os.environ.get("OMLX_INKLING2_MK_AFFINE", "1") != "0"
+# The bit-exact fused kernels above (and MK_SINGLE, MK_NORM3, MK_ROUTER) default on in this branch; set a flag to 0
+# to disable it. The non-exact flags (MK_ROUTER_PERROW, MK_LOOP_FAST) stay default off.
+_MK_EXACT_DEFAULT_ON = ("MOE", "OPROJ", "PREP", "NORM3", "PREP_ROWS", "MOE_ROWS", "OPROJ_ROWS", "ROUTE_ROWS", "SINGLE", "AFFINE", "ROUTER")
+_MK_ACTIVE = sorted(
+    {"OMLX_INKLING2_MK_" + f for f in _MK_EXACT_DEFAULT_ON if os.environ.get("OMLX_INKLING2_MK_" + f, "1") != "0"}
+    | {k for k, v in os.environ.items() if k.startswith("OMLX_INKLING2_MK_") and k[17:] not in _MK_EXACT_DEFAULT_ON and v not in ("", "0")}
+)
 if _MK_ACTIVE:
     import logging as _logging
 
@@ -585,9 +591,9 @@ def _router_logits_rows(flat, w):
         return mx.concatenate([xf[i : i + 1] @ w.T for i in range(xf.shape[0])], axis=0)
     return xf @ w.T
 # Megakernel slice 10: looped sliding visits' three input norms + casts + stack in one kernel.
-_MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "") == "1"
+_MK_NORM3 = os.environ.get("OMLX_INKLING2_MK_NORM3", "1") != "0"
 # Megakernel slice 4: MLP input norm + bf16 + router GEMV in one kernel (with _MK_MOE).
-_MK_ROUTER = os.environ.get("OMLX_INKLING2_MK_ROUTER", "") == "1"
+_MK_ROUTER = os.environ.get("OMLX_INKLING2_MK_ROUTER", "1") != "0"
 _taps_stacked: dict = {}
 
 

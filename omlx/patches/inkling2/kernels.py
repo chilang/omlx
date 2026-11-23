@@ -901,8 +901,8 @@ _nvfp4_rows_exact_kernel = None
 import os as _os
 
 _EXACT_VERIFY_EXPERTS = _os.environ.get("OMLX_INKLING2_EXACT_VERIFY", "") == "1"
-# Verify widths: singleton experts take a one-pair branch (OMLX_INKLING2_MK_SINGLE=1).
-MK_SINGLE = int(_os.environ.get("OMLX_INKLING2_MK_SINGLE", "0") == "1")
+# Verify widths: singleton experts take a one-pair branch (default on; OMLX_INKLING2_MK_SINGLE=0 disables).
+MK_SINGLE = int(_os.environ.get("OMLX_INKLING2_MK_SINGLE", "1") != "0")
 
 
 # Loop-controller projections for decode/verify-sized rows: FP32 inputs times
