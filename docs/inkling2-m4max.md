@@ -2,8 +2,14 @@
 
 > **Status (2026-11-23):** this branch is based on oMLX 0.8.2. Upstream has since released 0.8.3 and merged its own
 > versions of several of these optimizations, plus fixes this branch lacks (for example an HTTP 500 on M1 from oversized
-> threadgroups and an FP16 NVFP4 overflow fix). It has only been measured on an M4 Max. A comparison against upstream
-> main is in progress; until then, prefer upstream oMLX unless you are on an M4 Max and want these exact kernels.
+> threadgroups and an FP16 NVFP4 overflow fix). It has only been measured on an M4 Max.
+>
+> Measured against upstream main (`04e6e8e0`) on the same M4 Max: this branch's forward step is 17% faster at one token
+> and 23-28% faster at 3-4 verify rows (partly because upstream's verify is row-exact, which this branch's is not); one-stream decode on a code prompt is 1.20x upstream with MTP depth 2 and 1.07x with
+> MTP off. Upstream is 7% faster on time to first token at 16K tokens. Upstream's greedy output (MTP off) differs from this
+> branch on 3 of 4 test prompts, because upstream's numerics changed after 0.8.2. Work is under way to bring the expert
+> kernels to upstream. Until then: on an M4 Max, this branch is faster for decode; elsewhere, or if you need the newer
+> fixes, use upstream oMLX.
 
 This branch (`prod/fused-20261123`) is oMLX 0.8.2 plus a series of Inkling 2
 kernel changes tuned on an M4 Max (40-core GPU, 128 GB). It is not upstreamed. All changes are in
