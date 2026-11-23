@@ -396,15 +396,16 @@ class Inkling2Experts(nn.Module):
         activation dtype (the MLP conv kernel does, on read)."""
         return moe_sum(*self.unreduced(x, inds, weights))
 
-    def unreduced(self, x: mx.array, inds: mx.array, weights: mx.array):
+    def unreduced(self, x: mx.array, inds: mx.array, weights: mx.array, pairs=None):
         """The routed expert outputs [N, K, H] and their FP32 weights [N, K]
-        (NVFP4 tensor scale included), before ``moe_sum``."""
+        (NVFP4 tensor scale included), before ``moe_sum``. ``pairs``: the
+        flat routing's (order, experts) by expert, if the router made them."""
         xe = mx.expand_dims(x, (-2, -3))
         # Sorting regroups the pairs by expert and changes their arithmetic;
         # row-exact verify rows keep the per-pair gather of a decode step.
         do_sort = inds.size >= 64 and not is_row_exact_armed()
         if not do_sort and inds.shape[0] <= _GROUPED_MAX_ROWS:
-            grouped = self._grouped(x, inds, weights)
+            grouped = self._grouped(x, inds, weights, pairs)
             if grouped is not None:
                 return grouped
         idx = inds
@@ -428,7 +429,7 @@ class Inkling2Experts(nn.Module):
         return z, weights
 
 
-    def _grouped(self, x, inds, weights):
+    def _grouped(self, x, inds, weights, pairs=None):
         """``unreduced`` for a few unsorted rows with each distinct expert's
         weights read once for all the rows routed to it; per pair the same
         arithmetic as ``gather_qmm``, so the outputs are the stock bits."""
@@ -457,17 +458,20 @@ class Inkling2Experts(nn.Module):
         else:
             return None
         rows, top = inds.shape
-        flat = inds.reshape(-1)
-        order = mx.argsort(flat).astype(mx.uint32)
-        sorted_e = flat[order]
-        y = gather(x, w13, top).reshape(rows, top, 1, -1)
-        s13 = w13.post_scale(inds, y.dtype)
-        if s13 is not None:
-            s13 = s13[..., None, None].astype(y.dtype)
-        act = _softcapped_swiglu(
-            y[..., 0::2], y[..., 1::2], self._gcap, self._ucap, s13
+        if pairs is None:
+            flat = inds.reshape(-1)
+            order = mx.argsort(flat).astype(mx.uint32)
+            pairs = (order, flat[order])
+        order, sorted_e = pairs
+        y = gather(x, w13, top)
+        act = kernels.scaled_swiglu(
+            y,
+            w13.global_scale if w13.mode == "nvfp4" else None,
+            inds,
+            1.0 / _NVFP4_DENOMINATOR,
+            self._caps,
         )
-        z = gather(act.reshape(rows * top, -1), w2, 1).reshape(rows, top, -1)
+        z = gather(act, w2, 1).reshape(rows, top, -1)
         s2 = w2.post_scale(inds, act.dtype)
         if s2 is not None:
             weights = weights * s2
@@ -513,8 +517,25 @@ class Inkling2MoE(nn.Module):
         flat = x.reshape(-1, shape[-1])
         if x32 is not None:
             x32 = x32.reshape(-1, shape[-1])
-        inds, w = self.route(flat, x32)
-        z, w = self.experts.unreduced(flat, inds, w)
+        pairs = None
+        rows = flat.shape[0]
+        if (
+            rows <= _GROUPED_MAX_ROWS
+            and (rows * self.top_k < 64 or is_row_exact_armed())
+            and mx.default_device() == mx.gpu
+            and self.router_weight.shape[0] % 32 == 0
+        ):
+            # The routing kernel also orders the pairs by expert for the
+            # grouped experts (no separate argsort and gather).
+            logits = _row_matmul(
+                flat.astype(mx.float32) if x32 is None else x32, self.router_weight.T
+            )
+            inds, w, *pairs = kernels.route_topk_sorted_rows(
+                logits, self.router_bias, self.top_k, self.route_scale
+            )
+        else:
+            inds, w = self.route(flat, x32)
+        z, w = self.experts.unreduced(flat, inds, w, pairs)
         return z.reshape(*shape[:-1], *z.shape[-2:]), w.reshape(*shape[:-1], -1)
 
     def decode_conv(self, x, x32, conv_w, state, scale, residual):

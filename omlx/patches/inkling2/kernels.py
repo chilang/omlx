@@ -2485,3 +2485,106 @@ def _tiny_downs(top):
         output_shapes=[(1, 1, 2), (1, 4, 2)],
         output_dtypes=[mx.bfloat16, mx.float32],
     )[0]
+
+
+# Verify-width glue for ``Inkling2Experts._grouped``: the tensor scale and
+# softcapped SwiGLU in one kernel, and routing that also emits the pairs in
+# expert order (any order within an expert gives the same per-pair bits).
+_SWIGLU_SOURCE = """
+#pragma METAL fp contract(off)
+    uint j = thread_position_in_grid.x;
+    uint p = thread_position_in_grid.y;
+    if (j >= I) return;
+    float g = static_cast<float>(y[(size_t)p * 2 * I + 2 * j]);
+    float u = static_cast<float>(y[(size_t)p * 2 * I + 2 * j + 1]);
+    if (HAS_S) {
+        float sv = gs[inds[p / SDIV]] * inv_den[0];
+        float sb = static_cast<float>(static_cast<bfloat16_t>(sv));
+        g = static_cast<float>(static_cast<T>(g * sb));
+        u = static_cast<float>(static_cast<T>(u * sb));
+    }
+    const float gc = caps[0], uc = caps[1];
+    float sg = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+    sg = (g < 0.0f) ? sg : 1.0f - sg;
+    float a = metal::precise::tanh(g / gc) * gc;
+    a = a * sg;
+    float b = metal::precise::tanh(u / uc) * uc;
+    out[(size_t)p * I + j] = static_cast<T>(a * b);
+"""
+_swiglu_kernel = None
+
+
+def scaled_swiglu(y, global_scale, inds, inv_den, caps, sdiv=1):
+    """``y`` [P, 2I] BF16 rows (row-contiguous); the scale of pair p is
+    ``global_scale[inds[p // sdiv]] * inv_den`` (``global_scale`` None: no
+    scale); ``caps`` [2] FP32 (gate, up). Returns [P, I] in y's dtype."""
+    global _swiglu_kernel
+    if _swiglu_kernel is None:
+        _swiglu_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_scaled_swiglu",
+            input_names=["y", "gs", "inds", "inv_den", "caps"],
+            output_names=["out"],
+            source=_SWIGLU_SOURCE,
+        )
+    p, two_i = y.shape
+    has_s = global_scale is not None
+    zero = mx.zeros((1,), mx.uint32)
+    (out,) = _swiglu_kernel(
+        inputs=[y, global_scale if has_s else mx.zeros((1,), mx.float32),
+                inds.reshape(-1).astype(mx.uint32) if has_s else zero,
+                mx.array([inv_den], dtype=mx.float32), caps],
+        template=[("T", y.dtype), ("I", two_i // 2), ("HAS_S", int(has_s)), ("SDIV", sdiv)],
+        grid=(two_i // 2, p, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(p, two_i // 2)],
+        output_dtypes=[y.dtype],
+    )
+    return out
+
+
+_ROUTER_ROWS_SOURCE = _ROUTER_SOURCE.replace(
+    "    uint row = threadgroup_position_in_grid.x;\n    uint lane = thread_index_in_simdgroup;",
+    "    uint row = simdgroup_index_in_threadgroup;\n    uint lane = thread_index_in_simdgroup;\n"
+    "    threadgroup uint all_e[ROWS * K];\n    if (row < ROWS) {",
+).rstrip() + """
+        if (lane == 0) for (uint k = 0; k < K; ++k) all_e[row * K + k] = chosen[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+        // Parallel stable rank: pair i goes to the number of pairs before it in (expert, index) order.
+        uint i = row * 32 + lane;
+        if (i < ROWS * K) {
+            uint ei = all_e[i];
+            uint rank = 0;
+            for (uint j = 0; j < ROWS * K; ++j) {
+                uint ej = all_e[j];
+                rank += (ej < ei || (ej == ei && j < i)) ? 1u : 0u;
+            }
+            order[rank] = i;
+            sorted_e[rank] = ei;
+        }
+    }
+"""
+_router_rows_kernel = None
+
+
+def route_topk_sorted_rows(logits, bias, top_k, route_scale):
+    """``route_topk`` for R rows (R <= 32) plus (order, sorted experts) [R*K] u32."""
+    global _router_rows_kernel
+    rows, experts = logits.shape
+    if _router_rows_kernel is None:
+        _router_rows_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_route_topk_sorted_rows",
+            input_names=["logits", "bias", "route_scale"],
+            output_names=["inds", "weights", "order", "sorted_e"],
+            source=_ROUTER_ROWS_SOURCE,
+        )
+    inds, weights, order, sorted_e = _router_rows_kernel(
+        inputs=[logits.astype(mx.float32), bias.astype(mx.float32), mx.array([route_scale], dtype=mx.float32)],
+        template=[("E", experts), ("K", top_k), ("ROWS", rows)],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(rows * 32, 1, 1),
+        output_shapes=[(rows, top_k), (rows, top_k), (rows * top_k,), (rows * top_k,)],
+        output_dtypes=[mx.uint32, mx.float32, mx.uint32, mx.uint32],
+    )
+    return inds, weights, order, sorted_e
