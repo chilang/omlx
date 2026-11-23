@@ -1,5 +1,10 @@
 # Faster Inkling 2 Mini decode on Apple Silicon (fork branch)
 
+> **Status (2026-11-23):** this branch is based on oMLX 0.8.2. Upstream has since released 0.8.3 and merged its own
+> versions of several of these optimizations, plus fixes this branch lacks (for example an HTTP 500 on M1 from oversized
+> threadgroups and an FP16 NVFP4 overflow fix). It has only been measured on an M4 Max. A comparison against upstream
+> main is in progress; until then, prefer upstream oMLX unless you are on an M4 Max and want these exact kernels.
+
 This branch (`prod/fused-20261123`) is oMLX 0.8.2 plus a series of Inkling 2
 kernel changes tuned on an M4 Max (40-core GPU, 128 GB). It is not upstreamed. All changes are in
 `omlx/patches/inkling2/{kernels,model}.py` and `omlx/cache/paged_ssd_cache.py`; the Inkling kernels are built at run time
