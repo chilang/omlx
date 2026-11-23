@@ -1992,9 +1992,11 @@ _NVFP4_ROWS_SOURCE = """
 #pragma METAL fp contract(off)
     uint p = threadgroup_position_in_grid.y;
     uint e = sorted_e[p];
-    if (p > 0 && sorted_e[p - 1] == e) {
-        return;
-    }
+    // Each run of pairs on one expert is taken in chunks of MAXR, each by
+    // the threadgroup of the chunk's first pair.
+    int back = 0;
+    while (back < (int)p && sorted_e[p - back - 1] == e) back++;
+    if (back % MAXR) return;
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     int cnt = 1;
@@ -2185,7 +2187,11 @@ _AFF4_ROWS_SOURCE = """
 #pragma METAL fp contract(off)
     uint p = threadgroup_position_in_grid.y;
     uint e = sorted_e[p];
-    if (p > 0 && sorted_e[p - 1] == e) return;
+    // Each run of pairs on one expert is taken in chunks of MAXR, each by
+    // the threadgroup of the chunk's first pair.
+    int back = 0;
+    while (back < (int)p && sorted_e[p - back - 1] == e) back++;
+    if (back % MAXR) return;
     uint simd_gid = simdgroup_index_in_threadgroup;
     uint lane = thread_index_in_simdgroup;
     int cnt = 1;
@@ -2440,8 +2446,8 @@ def nvfp4_expert_decode(x, w13, w2, inds, weights, inv_den, caps, conv_w, state,
     if (
         mx.default_device() != mx.gpu
         or top > 8
-        or hidden % 256
-        or n2 % 4
+        or hidden % 16
+        or n2 % 32
         or not _fits_threadgroup(("expert_downs", top), lambda: _tiny_downs(top))
     ):
         return None
